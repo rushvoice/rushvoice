@@ -35,10 +35,11 @@ pub const OPENAI_SEGMENT_TRANSCRIBE_MODEL: &str = "whisper-1";
 /// カスタム接続先でモデル名を空にしたときの既定 (whisper.cpp server 等はモデル名を見ない)
 pub const CUSTOM_TRANSCRIBE_DEFAULT_MODEL: &str = "whisper-1";
 
-/// Groq の整文モデル (指示を最も忠実に守る)
-pub const GROQ_CHAT_MODEL: &str = "llama-3.3-70b-versatile";
-/// Groq の日次枠が尽きたときの退避先 (小型・日次枠が大きい)
-pub const GROQ_CHAT_FALLBACK_MODEL: &str = "llama-3.1-8b-instant";
+/// Groq の整文モデル。2026-11-16: llama-3.3-70b-versatile / llama-3.1-8b-instant が
+/// Groq で使えなくなったため gpt-oss へ (設定の「モデル名」で上書きできる)。
+pub const GROQ_CHAT_MODEL: &str = "openai/gpt-oss-120b";
+/// Groq の日次枠が尽きたときの退避先 (小型)
+pub const GROQ_CHAT_FALLBACK_MODEL: &str = "openai/gpt-oss-20b";
 /// OpenAI の整文モデル
 pub const OPENAI_CHAT_MODEL: &str = "gpt-4o-mini";
 
@@ -49,6 +50,41 @@ pub const CUSTOM_TRANSCRIBE_MODEL_KEY: &str = "custom_transcribe_model";
 pub const LLM_PROVIDER_KEY: &str = "llm_provider";
 pub const CUSTOM_LLM_BASE_URL_KEY: &str = "custom_llm_base_url";
 pub const CUSTOM_LLM_MODEL_KEY: &str = "custom_llm_model";
+/// Groq / OpenAI の整文モデル名の上書き (空なら既定)。提供元がモデルを廃止しても設定で直せるように。
+pub const GROQ_LLM_MODEL_KEY: &str = "groq_llm_model";
+pub const OPENAI_LLM_MODEL_KEY: &str = "openai_llm_model";
+
+/// 考える段階を持つモデル (gpt-oss) は、出力上限に考えた分も数えられる。
+/// 考える量を最小にし、上限に余白を足さないと本文が切れて原文に戻ってしまう。
+pub const REASONING_EFFORT: &str = "low";
+pub const REASONING_TOKEN_HEADROOM: u32 = 1024;
+
+/// gpt-oss 系なら reasoning_effort を付ける (他のモデルに付けると 400 になる接続先がある)。
+pub fn reasoning_effort_for(model: &str) -> Option<&'static str> {
+    if model.contains("gpt-oss") {
+        Some(REASONING_EFFORT)
+    } else {
+        None
+    }
+}
+
+/// 出力上限に、考える段階の分の余白を足す。
+pub fn with_reasoning_headroom(model: &str, max_tokens: u32) -> u32 {
+    if reasoning_effort_for(model).is_some() {
+        max_tokens + REASONING_TOKEN_HEADROOM
+    } else {
+        max_tokens
+    }
+}
+
+/// Groq / OpenAI のモデル名を設定で上書きする (カスタムは元からモデル名を持つので触らない)。
+pub fn apply_model_override(mut ep: ChatEndpoint, model_override: &str) -> ChatEndpoint {
+    let m = model_override.trim();
+    if ep.label != "custom" && !m.is_empty() {
+        ep.model = m.to_string();
+    }
+    ep
+}
 
 /// カスタム接続先の設定 (URL・モデル名)。キーは SecretsBundle 側。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -414,7 +450,13 @@ pub fn load_chat_endpoint() -> Result<ChatEndpoint, String> {
         base_url: kv(db.as_ref(), CUSTOM_LLM_BASE_URL_KEY),
         model: kv(db.as_ref(), CUSTOM_LLM_MODEL_KEY),
     };
-    resolve_chat_endpoint(provider, &load_keys(), &custom)
+    let ep = resolve_chat_endpoint(provider, &load_keys(), &custom)?;
+    let override_key = match ep.label {
+        "groq" => GROQ_LLM_MODEL_KEY,
+        "openai" => OPENAI_LLM_MODEL_KEY,
+        _ => return Ok(ep),
+    };
+    Ok(apply_model_override(ep, &kv(db.as_ref(), override_key)))
 }
 
 // ===========================================================================
@@ -687,6 +729,10 @@ mod tests {
         assert_eq!(g.url, "https://api.groq.com/openai/v1/chat/completions");
         assert_eq!(g.fallback_model.as_deref(), Some(GROQ_CHAT_FALLBACK_MODEL));
 
+        // モデル名の上書き: Groq / OpenAI は効き、空なら既定のまま
+        let over = apply_model_override(g.clone(), " qwen/qwen3.8-27b ");
+        assert_eq!(over.model, "qwen/qwen3.8-27b");
+        assert_eq!(apply_model_override(g.clone(), "  ").model, GROQ_CHAT_MODEL);
         let o = resolve_chat_endpoint(LlmProvider::Openai, &keys(None, Some("o")), &Default::default()).unwrap();
         assert_eq!(o.model, OPENAI_CHAT_MODEL);
         assert!(o.fallback_model.is_none());
@@ -737,5 +783,18 @@ mod tests {
         assert!(req.headers().get("authorization").is_none());
         let req = with_auth(client.get("http://localhost/v1/models"), "k").build().unwrap();
         assert!(req.headers().get("authorization").is_some());
+    }
+
+    #[test]
+    fn reasoning_params_only_for_gpt_oss() {
+        assert_eq!(reasoning_effort_for("openai/gpt-oss-120b"), Some("low"));
+        assert_eq!(reasoning_effort_for("gpt-oss:20b"), Some("low"));
+        assert_eq!(reasoning_effort_for("gpt-4o-mini"), None);
+        assert_eq!(reasoning_effort_for("qwen2.5:7b"), None);
+        assert_eq!(with_reasoning_headroom("openai/gpt-oss-20b", 100), 100 + REASONING_TOKEN_HEADROOM);
+        assert_eq!(with_reasoning_headroom("gpt-4o-mini", 100), 100);
+        // 既定のモデルが廃止済みの llama に戻っていないこと
+        assert!(!GROQ_CHAT_MODEL.contains("llama"));
+        assert!(!GROQ_CHAT_FALLBACK_MODEL.contains("llama"));
     }
 }
