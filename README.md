@@ -1,3 +1,5 @@
+<img src="src-tauri/icons/128x128.png" width="96" alt="RushVoice のアイコン">
+
 # RushVoice
 
 話した言葉を文字にして、いまカーソルがある場所へそのまま貼り付ける音声入力アプリです（Windows・macOS）。
