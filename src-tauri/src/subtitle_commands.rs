@@ -381,10 +381,13 @@ async fn translate_chat(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        "max_tokens": 1024,
+        "max_tokens": crate::endpoints::with_reasoning_headroom(&endpoint.model, 1024),
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
     });
+    if let Some(effort) = crate::endpoints::reasoning_effort_for(&endpoint.model) {
+        req["reasoning_effort"] = serde_json::json!(effort);
+    }
     // JSON モード (response_format) を受け付けないローカルサーバーがあるため、
     // 400 のときだけ外して 1 回だけ送り直す (プロンプト側でも JSON だけ返すよう指示済み)。
     let mut attempt = 0;

@@ -22,6 +22,8 @@ import {
   LLM_PROVIDER_KEY,
   CUSTOM_LLM_BASE_URL_KEY,
   CUSTOM_LLM_MODEL_KEY,
+  GROQ_LLM_MODEL_KEY,
+  OPENAI_LLM_MODEL_KEY,
   getHotkeyConfig,
   setHotkeyConfig,
   getHotkeyConflictState,
@@ -1212,10 +1214,24 @@ function EndpointSection() {
           onChange={(e) => changeSetting(LLM_PROVIDER_KEY, e.target.value, setLlmProvider)}
           disabled={!loaded}
         >
-          <option value="groq">Groq (llama-3.3-70b)</option>
+          <option value="groq">Groq (gpt-oss-120b)</option>
           <option value="openai">OpenAI (gpt-4o-mini)</option>
           <option value="custom">カスタム (OpenAI 互換・ローカル可)</option>
         </select>
+        {llmProvider === 'groq' && (
+          <ModelOverrideField
+            settingKey={GROQ_LLM_MODEL_KEY}
+            defaultModel="openai/gpt-oss-120b"
+            hint="空なら既定 (openai/gpt-oss-120b・日次の上限に当たったら openai/gpt-oss-20b)。Groq がモデルを入れ替えたときは、Groq のモデル一覧にある名前を入れてください。"
+          />
+        )}
+        {llmProvider === 'openai' && (
+          <ModelOverrideField
+            settingKey={OPENAI_LLM_MODEL_KEY}
+            defaultModel="gpt-4o-mini"
+            hint="空なら既定 (gpt-4o-mini)。"
+          />
+        )}
         {llmProvider === 'custom' && (
           <CustomEndpointFields
             provider="custom_llm"
@@ -1227,6 +1243,71 @@ function EndpointSection() {
           />
         )}
       </div>
+    </div>
+  )
+}
+
+/** Groq / OpenAI の整文モデル名の上書き。提供元がモデルを廃止したときにアプリの更新を待たずに直せるように。 */
+function ModelOverrideField({
+  settingKey,
+  defaultModel,
+  hint,
+}: {
+  settingKey: string
+  defaultModel: string
+  hint: string
+}) {
+  const [value, setValue] = useState('')
+  const [saved, setSaved] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    getSetting(settingKey)
+      .then((v) => {
+        setValue(v ?? '')
+        setSaved(v ?? '')
+      })
+      .catch((e) => console.warn('model override load failed:', e))
+  }, [settingKey])
+
+  const dirty = value.trim() !== saved
+
+  async function save() {
+    setBusy(true)
+    try {
+      await setSetting(settingKey, value.trim())
+      setSaved(value.trim())
+      toast.success(value.trim() ? `整文のモデルを ${value.trim()} にしました` : '整文のモデルを既定に戻しました')
+    } catch (e) {
+      toast.error(`保存失敗: ${e}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <label className="block text-xs text-neutral-400">モデル名 (空なら既定)</label>
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder={defaultModel}
+          spellCheck={false}
+          className="flex-1 px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-md text-sm focus:border-[var(--color-brand-500)] focus:outline-none font-mono"
+        />
+        <button
+          type="button"
+          onClick={save}
+          disabled={busy || !dirty}
+          className="px-3 py-2 bg-[var(--color-brand-500)] hover:bg-[var(--color-brand-700)] text-white text-xs rounded-md flex items-center gap-1.5 disabled:opacity-50"
+        >
+          <Save size={12} />
+          <span>{dirty ? '保存' : '保存済み'}</span>
+        </button>
+      </div>
+      <p className="text-[11px] text-neutral-500 leading-relaxed">{hint}</p>
     </div>
   )
 }

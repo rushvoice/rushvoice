@@ -1,6 +1,6 @@
 // llm_postprocess.rs — Phase 2 A LLM 後処理パイプライン
 //
-// Groq Chat Completions API (llama-3.3-70b-versatile) を使用してテキストを
+// Chat Completions API (既定は Groq の openai/gpt-oss-120b) を使用してテキストを
 // プロファイルの llm_postprocess_prompt で整形する。
 //
 // 設計方針 (SSOT §6.2.1 3大禁忌遵守):
@@ -13,7 +13,7 @@
 //   - API 呼び出し失敗時もログ警告 + 元テキストをフォールバック返却 (録音フローを止めない)
 //
 // 接続先: endpoints::ChatEndpoint (Groq / OpenAI / OpenAI 互換のカスタム・ローカル LLM 可)
-//   既定は Groq の llama-3.3-70b-versatile。プロンプト・ガード (伸長・欠落・依頼の保持) と
+//   既定は Groq の openai/gpt-oss-120b (2026-11-16 llama 廃止で変更)。プロンプト・ガード (伸長・欠落・依頼の保持) と
 //   429 の扱いは接続先に依らず同じに効く。
 // タイムアウト: 10 秒
 
@@ -46,6 +46,9 @@ struct ChatRequest<'a> {
     messages: Vec<ChatRequestMessage<'a>>,
     max_tokens: u32,
     temperature: f32,
+    /// gpt-oss 系だけ付ける (endpoints::reasoning_effort_for)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -267,9 +270,14 @@ pub async fn apply_llm_postprocess(
         // 制約を課す。入力長に比例した上限にして創作の暴走を構造的に不可能にする。
         // 打ち切り (finish_reason="length") は下で検知して原文フォールバックするため、
         // 途中で切れたテキストが貼られる事故は起きない。
-        max_tokens: max_tokens_for(text, allow_template_expansion),
+        max_tokens: crate::endpoints::with_reasoning_headroom(
+            &endpoint.model,
+            max_tokens_for(text, allow_template_expansion),
+        ),
         temperature: 0.0,
+        reasoning_effort: crate::endpoints::reasoning_effort_for(&endpoint.model),
     };
+    let base_max_tokens = max_tokens_for(text, allow_template_expansion);
 
     // 2026-07-25 報告 (後処理が黙って止まる): 旧実装は status だけ見て本文を捨てていたため、
     // 429 が「分単位のレート制限」なのか「日次上限の枯渇」なのか切り分けられなかった。
@@ -330,6 +338,8 @@ pub async fn apply_llm_postprocess(
                 request.model,
                 fb
             );
+            request.max_tokens = crate::endpoints::with_reasoning_headroom(&fb, base_max_tokens);
+            request.reasoning_effort = crate::endpoints::reasoning_effort_for(&fb);
             request.model = fb;
             continue;
         }

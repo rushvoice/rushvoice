@@ -84,6 +84,9 @@ export const CUSTOM_TRANSCRIBE_MODEL_KEY = 'custom_transcribe_model'
 export const LLM_PROVIDER_KEY = 'llm_provider'
 export const CUSTOM_LLM_BASE_URL_KEY = 'custom_llm_base_url'
 export const CUSTOM_LLM_MODEL_KEY = 'custom_llm_model'
+/** Groq / OpenAI の整文モデル名の上書き (空なら既定) */
+export const GROQ_LLM_MODEL_KEY = 'groq_llm_model'
+export const OPENAI_LLM_MODEL_KEY = 'openai_llm_model'
 
 // ----- 旧版の有料アカウント (ゲートウェイ) 終了の案内 (2026-11-15) -----
 
