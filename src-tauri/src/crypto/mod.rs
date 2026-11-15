@@ -18,7 +18,7 @@
 //   - struct SecretsBundle (復号済み API キーバンドル)
 //   - fn protect_bytes(plain: &[u8]) -> Result<Vec<u8>, CryptoError>
 //   - fn unprotect_bytes(enc: &[u8]) -> Result<Vec<u8>, CryptoError>
-//   - fn save_secrets(path, groq, openai) -> Result<(), CryptoError>
+//   - fn save_secrets(path, &SecretsBundle) -> Result<(), CryptoError>
 //   - fn load_secrets(path) -> Result<Option<SecretsBundle>, CryptoError>
 //   - fn default_secrets_path() -> PathBuf
 //

@@ -5,7 +5,7 @@ pub mod clipboard;
 pub mod commands;
 pub mod config_db;
 pub mod crypto;
-pub mod gateway_auth;
+pub mod endpoints;
 pub mod glossary_csv;
 pub mod glossary_db;
 pub mod halu;
@@ -72,7 +72,6 @@ pub struct ActiveProfileKey(pub std::sync::Mutex<String>);
 
 use crate::app_rules_db::{default_app_rules_db_path, AppRulesDb};
 use crate::config_db::{default_config_db_path, ConfigDb};
-use crate::crypto::{default_secrets_path, load_secrets};
 use crate::glossary_db::{default_glossary_db_path, GlossaryDb};
 use crate::history_db::{default_history_db_path, HistoryDb};
 use crate::hotkey::{HotkeyConfig, HotkeyMode, HOTKEY_CONFIG_KEY};
@@ -272,6 +271,10 @@ pub fn run() {
                     Err(e) => log::error!("[migration] failed: {:?}", e),
                 }
             }
+
+            // 2026-11-15: 有料版のゲートウェイ終了。旧版でログインしていた利用者のログイン情報を捨て、
+            // 「自分のキーか接続先を設定してください」の案内を出す印を立てる (冪等・best-effort)。
+            endpoints::retire_gateway_login();
 
             // Day 25 Phase 2-G (SSOT v3.3): v0.1.6 (alias.db あり) → v0.1.7 マイグレーション。
             // Day 24 で実装した alias.db を既存ユーザー PC から削除する (best-effort)。
@@ -577,6 +580,10 @@ pub fn run() {
             commands::delete_api_key,
             commands::test_api_key,
             commands::test_stored_api_key,
+            // 2026-11-15: カスタム接続先 (OpenAI 互換・ローカル LLM) の接続テストと、ゲートウェイ終了の案内
+            commands::test_endpoint_url,
+            commands::get_gateway_retired_notice,
+            commands::dismiss_gateway_retired_notice,
             commands::start_recording,
             commands::stop_recording,
             commands::get_recording_state,
@@ -620,15 +627,6 @@ pub fn run() {
             // v0.1.10 機能 A: 混雑通知バナー設定 (config_db settings_kv)
             commands::get_congestion_config,
             commands::set_congestion_config,
-            // Gateway ログイン (feature/gateway-login): メール+コードログイン
-            gateway_auth::gateway_request_code,
-            gateway_auth::gateway_verify_code,
-            gateway_auth::gateway_status,
-            gateway_auth::gateway_logout,
-            // 購入導線 (2026-07-28): 403/429 バナー・設定画面から Stripe Checkout を開く
-            gateway_auth::gateway_open_checkout,
-            // プラン別ゲート (2026-07-28): 議事録 / セミナー字幕の表示可否
-            gateway_auth::gateway_pro_feature_access,
             // v0.1.12 F3 (A 案): autostart enable/disable ラッパ
             // (plugin 呼び出し + autostart_default_applied_v017_1 フラグ操作をセットで実施)
             commands::enable_autostart,
@@ -821,20 +819,21 @@ async fn handle_hotkey_event(app: tauri::AppHandle, event: HotkeyEvent) {
         }
     };
 
-    // Gateway ログイン: 転写経路モード (byok/gateway) を先に解決する。
-    // gateway モード時は BYOK Groq キー未設定でも録音を許可する
-    // (経路 URL/Bearer は resolve_endpoint_v2 がゲートウェイ + JWT に差し替えるため)。
-    let gateway_route = load_gateway_route_opt();
-    let api_key = match load_groq_key() {
-        Ok(k) => k,
+    // 接続先 (Groq / OpenAI / カスタム) を先に決める。未設定なら録音を始めずに知らせる
+    // (endpoints::load_transcribe_setup が設定画面への案内を含むメッセージを返す)。
+    let setup = match endpoints::load_transcribe_setup() {
+        Ok(s) => s,
         Err(e) => {
-            if gateway_route.is_some() {
-                log::info!("[gateway] BYOK Groq key absent; proceeding via gateway route");
-                String::new()
-            } else {
+            // ESC (取り消し) は接続先が無くても通す
+            if !matches!(event, HotkeyEvent::Cancel) {
                 let _ = app.emit("recorder:error", e);
                 show_overlay(&app);
                 return;
+            }
+            // 取り消しでは使わないので空の組で埋める
+            endpoints::TranscribeSetup {
+                primary: endpoints::TranscribeEndpoint::default(),
+                fallback: None,
             }
         }
     };
@@ -879,21 +878,15 @@ async fn handle_hotkey_event(app: tauri::AppHandle, event: HotkeyEvent) {
                         glossary_words.len(),
                         glossary_entries.len()
                     );
-                    // v0.1.9: provider + OpenAI key を読み込んで hedged 経路を通す
                     // v0.1.10 機能 A: 混雑通知バナー設定を読み込んで recorder に渡す
-                    let provider_choice = load_provider_choice();
-                    let openai_key = load_openai_key_opt();
                     let congestion = commands::load_congestion_config_or_default();
                     match stop_session_and_transcribe(
                         &holder,
-                        api_key.clone(),
-                        openai_key,
-                        provider_choice,
+                        setup.clone(),
                         glossary_words,
                         glossary_entries,
                         Some(app.clone()),
                         congestion,
-                        gateway_route.clone(),
                     ).await {
                         Ok(outcome) => {
                             // 2026-07-25: LLM 後処理後テキスト (履歴 refined_text 用・診断材料)
@@ -910,7 +903,7 @@ async fn handle_hotkey_event(app: tauri::AppHandle, event: HotkeyEvent) {
                             } else if !outcome.text.is_empty() {
                                 // Phase 2 A: アクティブプロファイルで LLM 後処理
                                 let final_text = commands::apply_profile_postprocess(
-                                    &app, &api_key, &outcome.text
+                                    &app, &outcome.text
                                 ).await;
                                 if let Err(e) = crate::clipboard::paste_or_type_text(&final_text) {
                                     log::warn!("[paste] failed: {}", e);
@@ -977,21 +970,15 @@ async fn handle_hotkey_event(app: tauri::AppHandle, event: HotkeyEvent) {
                 glossary_words.len(),
                 glossary_entries.len()
             );
-            // v0.1.9: provider + OpenAI key を読み込んで hedged 経路を通す
             // v0.1.10 機能 A: 混雑通知バナー設定を読み込んで recorder に渡す
-            let provider_choice = load_provider_choice();
-            let openai_key = load_openai_key_opt();
             let congestion = commands::load_congestion_config_or_default();
             match stop_session_and_transcribe(
                 &holder,
-                api_key.clone(),
-                openai_key,
-                provider_choice,
+                setup.clone(),
                 glossary_words,
                 glossary_entries,
                 Some(app.clone()),
                 congestion,
-                gateway_route.clone(),
             ).await {
                 Ok(outcome) => {
                     // 2026-07-25: LLM 後処理後テキスト (履歴 refined_text 用・診断材料)
@@ -1008,7 +995,7 @@ async fn handle_hotkey_event(app: tauri::AppHandle, event: HotkeyEvent) {
                     } else if !outcome.text.is_empty() {
                         // Phase 2 A: アクティブプロファイルで LLM 後処理
                         let final_text = commands::apply_profile_postprocess(
-                            &app, &api_key, &outcome.text
+                            &app, &outcome.text
                         ).await;
                         if let Err(e) = crate::clipboard::paste_or_type_text(&final_text) {
                             log::warn!("[paste] failed: {}", e);
@@ -1229,94 +1216,6 @@ fn show_main_window(app: &tauri::AppHandle) {
         }
     } else {
         log::warn!("[tray] main window not found");
-    }
-}
-
-fn load_groq_key() -> Result<String, String> {
-    let bundle = load_secrets(&default_secrets_path())
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    bundle
-        .groq_api_key
-        .ok_or_else(|| "Groq API キーが未設定です (設定画面で保存してください)".to_string())
-}
-
-/// v0.1.9: 保存済 OpenAI key を取得 (未設定なら Ok(None))。エラーは log のみで None に丸める
-/// (hedged 経路で OpenAI 無しでも Groq 単独に縮退するため、致命扱いしない)。
-pub(crate) fn load_openai_key_opt() -> Option<String> {
-    match load_secrets(&default_secrets_path()) {
-        Ok(Some(bundle)) => bundle.openai_api_key,
-        Ok(None) => None,
-        Err(e) => {
-            log::warn!("[secrets] load_openai_key_opt failed: {}; treating as None", e);
-            None
-        }
-    }
-}
-
-/// Gateway ログイン: 転写経路モードが "gateway" かつ JWT 保存済のときだけ
-/// Some(GatewayRoute) を返す。それ以外は None (= 従来 BYOK・既存ユーザー影響ゼロ)。
-/// mode=gateway なのに JWT が無い場合は warn ログを出して BYOK に縮退する。
-pub(crate) fn load_gateway_route_opt() -> Option<crate::recorder::GatewayRoute> {
-    let mode = ConfigDb::open(&default_config_db_path())
-        .ok()
-        .and_then(|db| {
-            db.get_kv(gateway_auth::TRANSCRIBE_ROUTE_MODE_KEY)
-                .ok()
-                .flatten()
-        })
-        .unwrap_or_else(|| gateway_auth::ROUTE_MODE_BYOK.to_string());
-    if mode != gateway_auth::ROUTE_MODE_GATEWAY {
-        return None;
-    }
-    // URL 未注入ビルドでは空 URL の経路を組み立てず BYOK に縮退する
-    // (空 base_url のまま送ると "/groq/..." という不正な宛先になる)。
-    if !gateway_auth::is_gateway_configured() {
-        log::warn!("[gateway] base URL not configured in this build; degrading to BYOK");
-        return None;
-    }
-    match load_secrets(&default_secrets_path()) {
-        Ok(Some(bundle)) => match bundle.gateway_jwt {
-            Some(jwt) => Some(crate::recorder::GatewayRoute {
-                base_url: gateway_auth::gateway_base_url(),
-                jwt,
-            }),
-            None => {
-                log::warn!("[gateway] route mode=gateway but JWT missing; degrading to BYOK");
-                None
-            }
-        },
-        Ok(None) => {
-            log::warn!("[gateway] route mode=gateway but secrets file absent; degrading to BYOK");
-            None
-        }
-        Err(e) => {
-            log::warn!(
-                "[gateway] load_secrets failed: {}; degrading to BYOK",
-                e
-            );
-            None
-        }
-    }
-}
-
-/// v0.1.9: provider 設定値を config_db から読み取る (未設定なら Hedged 既定)。
-pub(crate) fn load_provider_choice() -> crate::recorder::ProviderChoice {
-    use crate::config_db::{default_config_db_path, ConfigDb};
-    use crate::recorder::ProviderChoice;
-    match ConfigDb::open(&default_config_db_path()) {
-        Ok(db) => match db.get_kv("provider") {
-            Ok(Some(s)) => ProviderChoice::parse(&s),
-            Ok(None) => ProviderChoice::Hedged,
-            Err(e) => {
-                log::warn!("[config] read provider failed: {}; defaulting to Hedged", e);
-                ProviderChoice::Hedged
-            }
-        },
-        Err(e) => {
-            log::warn!("[config] open config_db failed: {}; defaulting to Hedged", e);
-            ProviderChoice::Hedged
-        }
     }
 }
 

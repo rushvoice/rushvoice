@@ -252,14 +252,13 @@ pub async fn meeting_stop(app: AppHandle, id: String) -> Result<(), String> {
     );
     log::info!("[meeting][dbg] emit Transcribing: id={}", id);
 
-    // Day 3: API キー取得 (既存通常録音 commands.rs:204-210 と同じパターン踏襲)。
-    // 既存通常録音: default_secrets_path → load_secrets → bundle.groq_api_key
-    let api_key = match load_groq_api_key() {
-        Ok(k) => k,
+    // 接続先 (区間の時刻が要るので verbose_json を返せる接続先: endpoints.rs)
+    let endpoint = match crate::endpoints::load_segment_transcribe_endpoint() {
+        Ok(ep) => ep,
         Err(e) => {
             // key が無ければ Transcribing で止めず、即 Error emit して return Ok する
             // (録音自体は成功し DB 行と WAV は残るため、後でエクスポート/手動転写可能)。
-            log::error!("[meeting] groq api key 取得失敗: {}", e);
+            log::error!("[meeting] 文字起こしの接続先が未設定: {}", e);
             let _ = app.emit(
                 EVENT_STATE_CHANGED,
                 MeetingStateEvent {
@@ -272,14 +271,19 @@ pub async fn meeting_stop(app: AppHandle, id: String) -> Result<(), String> {
     };
 
     // Day 3 / v0.1.16 精度向上 ブロック2: background transcribe spawn (即 return で UI 反応性確保)
-    // 定数 pub 化済: GROQ_TRANSCRIBE_URL / GROQ_MODEL / WHISPER_PROMPT
     //
     // ブロック2: 議事録モードでも辞書 (glossary) を適用する。
     //   - Whisper prompt に固有名詞 (replacement 列) を載せ転写段階の精度を上げる
     //     (通常録音 commands.rs:215 collect_glossary_words と同じパターン)
     //   - 転写後の segment text に pattern→replacement 置換を後処理で適用 (run_background_transcribe 内)
-    let api_url = crate::recorder::GROQ_TRANSCRIBE_URL.to_string();
-    let model = crate::recorder::GROQ_MODEL.to_string();
+    log::info!(
+        "[meeting] transcribe endpoint={} ({})",
+        endpoint.label,
+        crate::endpoints::host_for_log(&endpoint.url)
+    );
+    let api_url = endpoint.url.clone();
+    let api_key = endpoint.api_key.clone();
+    let model = endpoint.model.clone();
     // 通常録音と同じ helper を再利用 (pub(crate))。固有名詞を Whisper prompt 末尾に注入。
     let glossary_words = crate::commands::collect_glossary_words(&app);
     let glossary_entries = crate::commands::collect_glossary_entries(&app);
@@ -333,19 +337,6 @@ pub async fn meeting_stop(app: AppHandle, id: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 既存通常録音 (commands.rs::stop_recording) と同じパターンで Groq API キーを取得する。
-/// 取得経路: default_secrets_path → load_secrets → bundle.groq_api_key
-/// (pub(crate): セミナー字幕モード subtitle_commands.rs からも流用)
-pub(crate) fn load_groq_api_key() -> Result<String, String> {
-    let path = crate::crypto::default_secrets_path();
-    let bundle = crate::crypto::load_secrets(&path)
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    bundle
-        .groq_api_key
-        .ok_or_else(|| "Groq API キーが未設定です (設定画面で保存してください)".to_string())
-}
-
 /// 1 チャンクを transcribe して verbose_json body を返す (指数バックオフ付きリトライ)。
 ///
 /// MAX_RETRIES = 3 → 計 4 トライ (初回 + リトライ 3 回)。
@@ -374,7 +365,7 @@ async fn transcribe_chunk_with_retry(
             audio,
             file_name: format!("chunk_{:03}.wav", chunk_index),
             mime_type: "audio/wav".to_string(),
-            // Gateway PoC (SSOT §4-B(3)): スコープ外・現状挙動維持のため明示 true のみ追加。URL は変更しない。
+            // 区間の時刻を使うため verbose_json 必須 (接続先は endpoints::resolve_segment_transcribe_endpoint)
             verbose_json: true,
         };
         let cancel = CancellationToken::new();
@@ -628,7 +619,6 @@ async fn run_background_transcribe(
     );
     let refined_paragraphs = run_meeting_llm_postprocess(
         &client,
-        &api_key,
         &base_paragraphs,
         &llm_prompt,
     )
@@ -693,15 +683,17 @@ const MEETING_LLM_INTER_PARAGRAPH_MS: u64 = 250;
 /// が originals.len() を保証)。これが M5「全体失敗でも Completed 到達」の核。
 async fn run_meeting_llm_postprocess(
     client: &reqwest::Client,
-    api_key: &str,
     base_paragraphs: &[crate::meeting::Paragraph],
     llm_prompt: &str,
 ) -> Vec<crate::meeting::Paragraph> {
-    // API キー欠落時は LLM を一切呼ばず辞書版をそのまま使う (録音は守る)。
-    if api_key.trim().is_empty() {
-        log::warn!("[meeting] LLM postprocess skipped: api_key empty (using dictionary version)");
-        return base_paragraphs.to_vec();
-    }
+    // 整文の接続先が未設定なら LLM を一切呼ばず辞書版をそのまま使う (録音は守る)。
+    let endpoint = match crate::endpoints::load_chat_endpoint() {
+        Ok(ep) => ep,
+        Err(e) => {
+            log::warn!("[meeting] LLM postprocess skipped: {} (using dictionary version)", e);
+            return base_paragraphs.to_vec();
+        }
+    };
     if base_paragraphs.is_empty() {
         return Vec::new();
     }
@@ -715,7 +707,7 @@ async fn run_meeting_llm_postprocess(
         // あるため二重指示を避ける (言い直し解決の共通指示のみ効かせる)。
         let out = crate::llm_postprocess::apply_llm_postprocess(
             client,
-            api_key,
+            &endpoint,
             llm_prompt,
             &p.text,
             &crate::llm_postprocess::PostprocessOptions {
@@ -727,8 +719,6 @@ async fn run_meeting_llm_postprocess(
                 // 敬語化の検出対象から外す (2026-07-27)
                 allow_style_change: true,
             },
-            // gateway ログイン中は議事録整形も gateway 経由 (未ログインなら従来の BYOK)
-            crate::load_gateway_route_opt().as_ref(),
         )
         .await;
         // apply_llm_postprocess は失敗時 p.text をそのまま返すため、

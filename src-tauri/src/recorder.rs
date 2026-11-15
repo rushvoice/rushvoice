@@ -32,14 +32,8 @@ use crate::prompt_sanitize::{
 use crate::resampler::Resampler;
 use crate::transcribe::{build_client, transcribe, TranscribeRequest};
 
-/// Groq Whisper API URL (primary)
-pub const GROQ_TRANSCRIBE_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
-/// OpenAI Whisper API URL (fallback)
-pub const OPENAI_TRANSCRIBE_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
-/// Groq Whisper モデル名
-pub const GROQ_MODEL: &str = "whisper-large-v3-turbo";
-/// OpenAI Whisper モデル名 (v0.1.9 hedged fallback で使用)
-pub const OPENAI_MODEL: &str = "gpt-4o-mini-transcribe";
+// 接続先 (URL・モデル・キー) は endpoints.rs が決める (2026-11-15: ゲートウェイ終了・カスタム接続先対応)。
+use crate::endpoints::{TranscribeEndpoint, TranscribeSetup};
 
 // ---------------------------------------------------------------------------
 // 既知ハルシ句 (halu フィルタ Tier 3 / 3.2 / 3.5 に渡す)
@@ -191,94 +185,33 @@ fn build_request(
     }
 }
 
-/// Gateway PoC (2026-07-07 SSOT §4-B): 環境変数が両方あればゲートウェイ経由の
-/// (url, key) を返す。どちらか欠けたら従来の BYOK 直行 (合格条件5・既存ユーザー影響ゼロ)。
-///
-/// トークン値そのものはログしない (INFO ログは base URL + path のみ)。
-fn resolve_endpoint(
-    provider: crate::commands::Provider,
-    direct_url: &str,
-    direct_key: &str,
-) -> (String, String) {
-    if let (Ok(base), Ok(token)) = (
-        std::env::var("RUSHVOICE_GATEWAY_URL"),
-        std::env::var("RUSHVOICE_GATEWAY_TOKEN"),
-    ) {
-        let path = match provider {
-            crate::commands::Provider::Groq => "/groq/v1/audio/transcriptions",
-            crate::commands::Provider::Openai => "/openai/v1/audio/transcriptions",
-        };
-        let base_trimmed = base.trim_end_matches('/');
-        log::info!("[gateway] override active: {}{}", base_trimmed, path);
-        return (format!("{}{}", base_trimmed, path), token);
-    }
-    (direct_url.to_string(), direct_key.to_string())
-}
-
-/// Gateway ログイン (feature/gateway-login): 転写経路が gateway モードのときの経路情報。
-/// jwt は DPAPI 保存済みのログイン JWT (ログに出さない)。
-#[derive(Debug, Clone)]
-pub struct GatewayRoute {
-    pub base_url: String,
-    pub jwt: String,
-}
-
-/// Gateway ログイン: 経路解決 v2 (L294: 検証済み resolve_endpoint に分岐を混ぜず新関数に抽出)。
-///
-/// - gateway = Some → ログイン JWT でゲートウェイ経由 (mode="gateway")
-/// - gateway = None → 従来の resolve_endpoint (env 両方セット時の PoC override → BYOK 直行)
-///   既存ユーザーの挙動 (mode="byok" デフォルト) は不変。
-fn resolve_endpoint_v2(
-    gateway: Option<&GatewayRoute>,
-    provider: crate::commands::Provider,
-    direct_url: &str,
-    direct_key: &str,
-) -> (String, String) {
-    if let Some(g) = gateway {
-        let path = match provider {
-            crate::commands::Provider::Groq => "/groq/v1/audio/transcriptions",
-            crate::commands::Provider::Openai => "/openai/v1/audio/transcriptions",
-        };
-        let base_trimmed = g.base_url.trim_end_matches('/');
-        log::info!("[gateway] login route active: {}{}", base_trimmed, path);
-        return (format!("{}{}", base_trimmed, path), g.jwt.clone());
-    }
-    resolve_endpoint(provider, direct_url, direct_key)
-}
-
-/// Gateway ログイン: transcribe エラーメッセージから 403/429 (entitlement 系) を検出する純粋関数。
+/// transcribe エラーメッセージから HTTP の状態 (401/403/429) を取り出す純粋関数。
 ///
 /// エラー文字列は `format!("... {:?}", e)` 由来のため、
 /// `TranscribeError::Http { status: 403, .. }` の Debug 表現 ("status: 403") を見る。
 /// hedged 経路 (HedgedError::BothFailed 等) も内包する TranscribeError の Debug が
-/// そのまま含まれるため同じ判定で拾える。
-pub fn detect_entitlement_status(err_msg: &str) -> Option<u16> {
-    if err_msg.contains("status: 403") || err_msg.contains("HTTP 403") {
-        Some(403)
-    } else if err_msg.contains("status: 429") || err_msg.contains("HTTP 429") {
-        Some(429)
-    } else {
-        None
+/// そのまま含まれるため同じ判定で拾える。接続先 (Groq/OpenAI/カスタム) に依らない。
+pub fn detect_auth_or_limit_status(err_msg: &str) -> Option<u16> {
+    for code in [401u16, 403, 429] {
+        if err_msg.contains(&format!("status: {}", code)) || err_msg.contains(&format!("HTTP {}", code)) {
+            return Some(code);
+        }
     }
+    None
 }
 
-/// 403 のうち「ログインの有効期限切れ・トークン不正」か (ゲートウェイは `invalid_token` を返す)。
-///
-/// 2026-11-11: 利用者の PC でログイン切れの 403 を「プランが無効」と出し、購入ボタンまで
-/// 出していた。プランは有効だったため、ログイン切れは再ログインの案内に分ける (利用者 OK)。
-pub fn is_login_expired_error(err_msg: &str) -> bool {
-    err_msg.contains("invalid_token")
-}
-
-/// ログイン切れのバナー文言。
-pub const LOGIN_EXPIRED_MESSAGE: &str =
-    "ログインの有効期限が切れています。設定の「RushVoice アカウント」からログインし直してください。";
-
-/// Gateway ログイン: 403/429 のユーザー向けバナー文言 (設計書 A-2-4・L337: alert 禁止準拠)。
-pub fn entitlement_message(status: u16) -> &'static str {
-    match status {
-        403 => "プランが無効です。RushVoice アカウントの契約状態を確認してください。",
-        _ => "利用上限に達しました。しばらく待つかプランをご確認ください。",
+/// 401/403/429 のとき、利用者が次に何をすればよいかを先頭に付ける (純粋関数)。
+pub fn friendly_transcribe_error(err_msg: &str) -> String {
+    match detect_auth_or_limit_status(err_msg) {
+        Some(401) | Some(403) => format!(
+            "接続先が API キーを受け付けませんでした。設定の「接続先とAPIキー」でキーを確かめてください。({})",
+            err_msg
+        ),
+        Some(429) => format!(
+            "接続先の利用上限に達しました。しばらく待つか、設定で別の接続先を選んでください。({})",
+            err_msg
+        ),
+        _ => err_msg.to_string(),
     }
 }
 
@@ -416,28 +349,13 @@ impl Default for CongestionConfig {
     }
 }
 
-/// OpenAI へ回せるか。手元に OpenAI 鍵がある (BYOK) か、ゲートウェイ経由
-/// (鍵はゲートウェイ側が持つ) なら true。
-pub fn openai_available(openai_api_key: Option<&str>, via_gateway: bool) -> bool {
-    via_gateway || openai_api_key.is_some()
-}
-
 /// v0.1.10 機能 A: タイマ開始の可否を純粋関数として判定する。
 ///
 /// 仕様 (SSOT A-5):
-/// - Hedged プロバイダーかつ show_in_hedged=false なら抑止 (false)
+/// - 実際に hedged で並走するとき (`is_hedged`) かつ show_in_hedged=false なら抑止 (false)
 /// - それ以外は表示 (true)
-///
-/// 単体テスト容易性のため別関数化。
-pub fn should_show_congestion_banner(
-    provider: ProviderChoice,
-    has_openai_key: bool,
-    show_in_hedged: bool,
-) -> bool {
-    // Hedged 選択 + OpenAI key 有 のときのみ「実際の hedged 動作」
-    // (key 無しは Groq 単独に縮退するためバナー対象)
-    let actually_hedged = matches!(provider, ProviderChoice::Hedged) && has_openai_key;
-    if actually_hedged {
+pub fn should_show_congestion_banner(is_hedged: bool, show_in_hedged: bool) -> bool {
+    if is_hedged {
         show_in_hedged
     } else {
         true
@@ -480,8 +398,7 @@ fn emit_congestion_cleared(app: Option<&tauri::AppHandle>) {
 
 /// v0.1.9: run_transcription の戻り値型エイリアス。
 ///
-/// 7 要素タプル: (body, transcribe_ms, audio_bytes, used_provider, primary_ms, fallback_triggered, hedged_winner)
-/// clippy::type_complexity 対策で type alias に切り出す (v0.1.10 機能 A 実装で内部 let 束縛が必要になったため)。
+/// 8 要素タプル: (body, transcribe_ms, audio_bytes, used_provider, primary_ms, fallback_triggered, hedged_winner, model)
 type TranscribeRunResult = (
     String,
     i64,
@@ -490,100 +407,51 @@ type TranscribeRunResult = (
     Option<i64>,
     Option<bool>,
     Option<String>,
+    String,
 );
 
-/// v0.1.9: provider 設定に基づき hedged / Groq solo / OpenAI solo を選択し、
-/// 文字起こし結果を返す中核ロジック。
+fn request_for(ep: &TranscribeEndpoint, prompt: &str, wav: Vec<u8>) -> TranscribeRequest {
+    build_request(&ep.url, &ep.api_key, &ep.model, prompt, wav, ep.verbose_json)
+}
+
+/// 接続先の組 (TranscribeSetup) に従い、hedged (primary が遅いとき fallback を並走) か
+/// 単独で文字起こしし、結果を返す中核ロジック。
 ///
-/// 戻り値: (body, transcribe_ms, audio_bytes, used_provider, primary_ms, fallback_triggered, hedged_winner)
+/// 戻り値: (body, transcribe_ms, audio_bytes, used_provider, primary_ms, fallback_triggered, hedged_winner, model)
 ///
-/// - used_provider: 実際に勝者となった プロバイダー文字列 ("groq" / "openai")
-/// - primary_ms: hedged 経路のときのみ Some (勝者単独所要 ms)
-/// - fallback_triggered: hedged 経路のときのみ Some
-/// - hedged_winner: hedged 経路のときのみ Some ("primary" / "fallback")
+/// - used_provider: 実際に勝者となった接続先の名前 ("groq" / "openai" / "custom")
+/// - primary_ms / fallback_triggered / hedged_winner: hedged 経路のときのみ Some
 ///
-/// v0.1.10 機能 A: `app` と `congestion` を受けて、各経路の transcribe 呼出前に
-/// 混雑通知バナーのタイマを spawn する。完了時は呼出側 (transcribe_collected) で
-/// emit_congestion_cleared() を呼ぶ前提で、ここではタイマ abort のみ行う。
-#[allow(clippy::too_many_arguments)]
+/// v0.1.10 機能 A: 各経路の transcribe 呼出前に混雑通知バナーのタイマを spawn する。
 async fn run_transcription(
     client: &reqwest::Client,
     dynamic_prompt: &str,
     wav: Vec<u8>,
     audio_bytes: i64,
-    groq_api_key: &str,
-    openai_api_key: Option<&str>,
-    provider: ProviderChoice,
+    setup: &TranscribeSetup,
     app: Option<tauri::AppHandle>,
     congestion: CongestionConfig,
-    // Gateway ログイン: Some ならゲートウェイ経由 (mode="gateway")・None なら従来 BYOK
-    gateway: Option<&GatewayRoute>,
 ) -> Result<TranscribeRunResult, String> {
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    // 経路選択: hedged + OpenAI が使える → dispatch_hedged
-    // ゲートウェイ経由 (ログイン) のときは OpenAI の鍵をゲートウェイ側が持つため、
-    // 手元に OpenAI 鍵が無くても OpenAI へ回せる (11-12: 鍵の有無だけで判定していたため
-    // ログイン利用では hedged が一度も動かず、Groq が遅い日に 12〜30 秒待たされた)。
-    let openai_available = openai_available(openai_api_key, gateway.is_some());
-    let openai_key_for_route = openai_api_key.unwrap_or("");
-    let use_hedged = matches!(provider, ProviderChoice::Hedged) && openai_available;
-    let use_openai_solo = matches!(provider, ProviderChoice::Openai) && openai_available;
-
-    if matches!(provider, ProviderChoice::Hedged) && !openai_available {
-        log::info!(
-            "[transcribe] provider=hedged selected but OpenAI key absent → degrading to Groq solo"
-        );
-    }
-    if matches!(provider, ProviderChoice::Openai) && !openai_available {
-        log::warn!(
-            "[transcribe] provider=openai selected but OpenAI key absent → degrading to Groq solo"
-        );
-    }
-
     // v0.1.10 機能 A: バナータイマ spawn (hedged 抑止判定後)
-    let banner_armed = should_show_congestion_banner(
-        provider,
-        openai_available,
-        congestion.show_in_hedged,
-    );
-    let banner_handle = if banner_armed {
+    let banner_handle = if should_show_congestion_banner(setup.is_hedged(), congestion.show_in_hedged) {
         spawn_congestion_timer(app.clone(), congestion.threshold_ms)
     } else {
         None
     };
 
+    log::info!(
+        "[transcribe] route primary={} ({}) fallback={:?}",
+        setup.primary.label,
+        crate::endpoints::host_for_log(&setup.primary.url),
+        setup.fallback.as_ref().map(|f| f.label)
+    );
+
     // 各経路の transcribe 結果を result_inner に詰め、最後にタイマ abort して return する設計。
-    // (途中 ? で早期 return しないように map_err → ? を関数末尾でまとめて処理)
-    let result_inner: Result<TranscribeRunResult, String> = if use_hedged {
-        let (primary_url, primary_key) = resolve_endpoint_v2(
-            gateway,
-            crate::commands::Provider::Groq,
-            GROQ_TRANSCRIBE_URL,
-            groq_api_key,
-        );
-        let primary_req = build_request(
-            &primary_url,
-            &primary_key,
-            GROQ_MODEL,
-            dynamic_prompt,
-            wav.clone(),
-            true,
-        );
-        let (fallback_url, fallback_key) = resolve_endpoint_v2(
-            gateway,
-            crate::commands::Provider::Openai,
-            OPENAI_TRANSCRIBE_URL,
-            openai_key_for_route,
-        );
-        let fallback_req = build_request(
-            &fallback_url,
-            &fallback_key,
-            OPENAI_MODEL,
-            dynamic_prompt,
-            wav,
-            false,
-        );
+    let result_inner: Result<TranscribeRunResult, String> = if let Some(fallback) = &setup.fallback {
+        let primary_req = request_for(&setup.primary, dynamic_prompt, wav.clone());
+        let fallback_req = request_for(fallback, dynamic_prompt, wav);
         let cfg = HedgedConfig {
             trigger_secs: 3.0,
             enable_fallback: true,
@@ -595,9 +463,10 @@ async fn run_transcription(
             Ok(resp) => {
                 let transcribe_ms: i64 = start.elapsed().as_millis() as i64;
                 let used_provider = match resp.winner {
-                    WinnerProvider::Primary => "groq".to_string(),
-                    WinnerProvider::Fallback => "openai".to_string(),
+                    WinnerProvider::Primary => setup.primary.label.to_string(),
+                    WinnerProvider::Fallback => fallback.label.to_string(),
                 };
+                let model = setup.model_for(&used_provider);
                 let primary_ms = Some(resp.winner_ms as i64);
                 let fallback_triggered = Some(resp.fallback_triggered);
                 let hedged_winner = Some(resp.winner_str().to_string());
@@ -605,91 +474,35 @@ async fn run_transcription(
                     "[transcribe] provider=hedged winner={} elapsed_ms={} primary_ms={} fallback_triggered={} bytes={}",
                     used_provider, transcribe_ms, resp.winner_ms, resp.fallback_triggered, audio_bytes
                 );
-                Ok((resp.body, transcribe_ms, audio_bytes, used_provider, primary_ms, fallback_triggered, hedged_winner))
+                Ok((resp.body, transcribe_ms, audio_bytes, used_provider, primary_ms, fallback_triggered, hedged_winner, model))
             }
             Err(e) => Err(format!("hedged transcribe failed: {:?}", e)),
         }
-    } else if use_openai_solo {
-        let (url, key) = resolve_endpoint_v2(
-            gateway,
-            crate::commands::Provider::Openai,
-            OPENAI_TRANSCRIBE_URL,
-            openai_key_for_route,
-        );
-        let req = build_request(&url, &key, OPENAI_MODEL, dynamic_prompt, wav, false);
-        let start = std::time::Instant::now();
-        match transcribe(client, req, cancel).await {
-            Ok(resp) => {
-                let transcribe_ms: i64 = start.elapsed().as_millis() as i64;
-                log::info!(
-                    "[transcribe] provider=openai elapsed_ms={} bytes={}",
-                    transcribe_ms, audio_bytes
-                );
-                Ok((resp.body, transcribe_ms, audio_bytes, "openai".to_string(), None, None, None))
-            }
-            Err(e) => Err(format!("transcribe failed (openai solo): {:?}", e)),
-        }
     } else {
-        // Groq 単独 (provider=Groq or hedged/openai 縮退)
-        let (url, key) = resolve_endpoint_v2(
-            gateway,
-            crate::commands::Provider::Groq,
-            GROQ_TRANSCRIBE_URL,
-            groq_api_key,
-        );
-        let req = build_request(&url, &key, GROQ_MODEL, dynamic_prompt, wav, true);
+        let ep = &setup.primary;
+        let req = request_for(ep, dynamic_prompt, wav);
         let start = std::time::Instant::now();
         match transcribe(client, req, cancel).await {
             Ok(resp) => {
                 let transcribe_ms: i64 = start.elapsed().as_millis() as i64;
                 log::info!(
-                    "[transcribe] provider=groq elapsed_ms={} bytes={}",
-                    transcribe_ms, audio_bytes
+                    "[transcribe] provider={} elapsed_ms={} bytes={}",
+                    ep.label, transcribe_ms, audio_bytes
                 );
-                Ok((resp.body, transcribe_ms, audio_bytes, "groq".to_string(), None, None, None))
+                Ok((resp.body, transcribe_ms, audio_bytes, ep.label.to_string(), None, None, None, ep.model.clone()))
             }
-            Err(e) => Err(format!("transcribe failed (groq solo): {:?}", e)),
+            Err(e) => Err(format!("transcribe failed ({} solo): {:?}", ep.label, e)),
         }
     };
 
     // v0.1.10 機能 A: 完了またはエラー時にバナータイマを必ず停止
-    // (success / error 両方で congestion-cleared を emit して UI バナー消去を保証する)
     if let Some(h) = banner_handle {
         h.abort();
     }
     emit_congestion_cleared(app.as_ref());
 
-    // Gateway ログイン (設計書 A-2-4): ゲートウェイ経由で 403/429 を受けたら
-    // インラインバナー用イベントを emit する (L337: alert 禁止・frontend でバナー表示)。
-    // 3 経路 (hedged / openai solo / groq solo) 共通の単一配線点。
-    if gateway.is_some() {
-        if let Err(msg) = &result_inner {
-            if let Some(status) = detect_entitlement_status(msg) {
-                let login_expired = status == 403 && is_login_expired_error(msg);
-                log::warn!(
-                    "[gateway] entitlement error detected: HTTP {} login_expired={}",
-                    status, login_expired
-                );
-                if let Some(app) = app.as_ref() {
-                    let (reason, message) = if login_expired {
-                        ("login_expired", LOGIN_EXPIRED_MESSAGE)
-                    } else {
-                        ("entitlement", entitlement_message(status))
-                    };
-                    let _ = app.emit(
-                        "gateway:entitlement-error",
-                        serde_json::json!({
-                            "status": status,
-                            "reason": reason,
-                            "message": message,
-                        }),
-                    );
-                }
-            }
-        }
-    }
-
-    result_inner
+    // 401/403/429 は接続先に依らず、次に何をすればよいかを添える
+    result_inner.map_err(|e| friendly_transcribe_error(&e))
 }
 
 /// Whisper へ渡す prompt 全体 (固定指示文 + 語彙ヒント) の上限文字数。
@@ -1412,13 +1225,15 @@ pub struct TranscribeOutcome {
 /// - `Hedged`: Groq primary + OpenAI fallback (3.0s trigger)。OpenAI key 無しなら Groq 単独に縮退。
 /// - `Groq`:   Groq 単独。
 /// - `Openai`: OpenAI 単独。OpenAI key 無しなら Groq 単独に縮退 (エラー UI 表示)。
+/// - `Custom`: 利用者が設定した OpenAI 互換の接続先 (ローカルの whisper.cpp server 等) 単独。
 ///
-/// パイロット 6 名各自で OpenAI 任意なため、key 無し時の縮退ロジックが重要。
+/// 実際の接続先の組み立ては endpoints::resolve_transcribe_setup。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderChoice {
     Hedged,
     Groq,
     Openai,
+    Custom,
 }
 
 impl ProviderChoice {
@@ -1427,6 +1242,7 @@ impl ProviderChoice {
         match s {
             "groq" => Self::Groq,
             "openai" => Self::Openai,
+            "custom" => Self::Custom,
             _ => Self::Hedged,
         }
     }
@@ -1442,7 +1258,7 @@ impl ProviderChoice {
 pub async fn toggle_recording(
     holder: &RecorderHolder,
     app: Option<AppHandle>,
-    api_key: String,
+    setup: TranscribeSetup,
     glossary_words: Vec<String>,
     // v0.1.3 patch3 (C-add): 後処理 pattern→replacement 置換用 entries
     glossary_entries: Vec<(String, String, bool)>,
@@ -1460,15 +1276,11 @@ pub async fn toggle_recording(
             // v0.1.10: 機能 A は本番経路のみ対象なので、legacy では app=None / default 設定で渡す。
             let outcome = stop_session_and_transcribe(
                 holder,
-                api_key,
-                None,
-                ProviderChoice::Groq,
+                setup,
                 glossary_words,
                 glossary_entries,
                 None,
                 CongestionConfig::default(),
-                // legacy 経路は BYOK 固定 (gateway ログイン経路は lib.rs / commands.rs のみ)
-                None,
             )
             .await?;
             Ok(ToggleResult::Transcribed(outcome.text))
@@ -1508,11 +1320,8 @@ pub fn stop_deadline_reached(
 #[allow(clippy::too_many_arguments)]
 pub async fn stop_session_and_transcribe(
     holder: &RecorderHolder,
-    groq_api_key: String,
-    // v0.1.9: hedged 用 OpenAI key (Some なら fallback armed)
-    openai_api_key: Option<String>,
-    // v0.1.9: provider 設定
-    provider: ProviderChoice,
+    // 接続先の組 (endpoints::load_transcribe_setup)
+    setup: TranscribeSetup,
     glossary_words: Vec<String>,
     // v0.1.3 patch3 (C-add): 後処理 pattern→replacement 置換用 entries
     // 各要素 = (pattern, replacement, is_regex)
@@ -1521,8 +1330,6 @@ pub async fn stop_session_and_transcribe(
     app: Option<AppHandle>,
     // v0.1.10 機能 A: 混雑通知バナー設定
     congestion: CongestionConfig,
-    // Gateway ログイン: Some ならゲートウェイ経由 (mode="gateway")・None なら従来 BYOK
-    gateway: Option<GatewayRoute>,
 ) -> Result<TranscribeOutcome, String> {
     let session = {
         let mut guard = holder.session.lock().map_err(|e| e.to_string())?;
@@ -1550,14 +1357,11 @@ pub async fn stop_session_and_transcribe(
         collected,
         session.device_sample_rate,
         session.device_channels,
-        &groq_api_key,
-        openai_api_key.as_deref(),
-        provider,
+        &setup,
         glossary_words,
         glossary_entries,
         app,
         congestion,
-        gateway,
     )
     .await;
 
@@ -1569,22 +1373,18 @@ pub async fn stop_session_and_transcribe(
     })
 }
 
-#[allow(clippy::too_many_arguments)] // v0.1.9: provider/key 拡張で 8 引数。v0.1.10 機能 A で 10 引数。
+#[allow(clippy::too_many_arguments)]
 async fn transcribe_collected(
     frames: Vec<RawFrame>,
     device_sample_rate: u32,
     device_channels: u16,
-    groq_api_key: &str,
-    openai_api_key: Option<&str>,
-    provider: ProviderChoice,
+    setup: &TranscribeSetup,
     glossary_words: Vec<String>,
     glossary_entries: Vec<(String, String, bool)>,
     // v0.1.10 機能 A: バナー emit 用 AppHandle
     app: Option<AppHandle>,
     // v0.1.10 機能 A: 混雑通知バナー設定
     congestion: CongestionConfig,
-    // Gateway ログイン: Some ならゲートウェイ経由 (mode="gateway")・None なら従来 BYOK
-    gateway: Option<GatewayRoute>,
 ) -> Result<TranscribeOutcome, String> {
     if frames.is_empty() {
         return Err("録音データが空です (無音 / 録音時間が短すぎ)".into());
@@ -1653,29 +1453,18 @@ async fn transcribe_collected(
         dynamic_prompt.chars().count()
     );
 
-    // v0.1.9: provider 設定と OpenAI key 有無で経路選択 (8-A: hedged 本番配線)
-    // -----------------------------------------------------------------------
-    // 経路:
-    //   1) Hedged + OpenAI key あり → dispatch_hedged(Groq primary, OpenAI fallback, 3.0s trigger)
-    //   2) Hedged + OpenAI key なし → Groq 単独 (縮退・log で明示)
-    //   3) Groq                     → Groq 単独
-    //   4) Openai + OpenAI key あり → OpenAI 単独
-    //   5) Openai + OpenAI key なし → Groq 単独 (縮退・log で明示)
-    //
-    // 戻り値で provider 文字列 ("groq" / "openai") を history.db に記録する
-    // (hedged 経路で勝者が groq なら provider="groq" / openai 勝者なら "openai")。
-    let (resp_body, transcribe_ms, audio_bytes_used, used_provider, primary_ms, fallback_triggered, hedged_winner) =
+    // 経路選択は endpoints::resolve_transcribe_setup で済んでいる
+    // (hedged = Groq primary + OpenAI fallback / 単独 = Groq・OpenAI・カスタム)。
+    // 勝者の接続先の名前 ("groq" / "openai" / "custom") を history.db に記録する。
+    let (resp_body, transcribe_ms, audio_bytes_used, used_provider, primary_ms, fallback_triggered, hedged_winner, model_name) =
         run_transcription(
             &client,
             &dynamic_prompt,
             wav,
             audio_bytes,
-            groq_api_key,
-            openai_api_key,
-            provider,
+            setup,
             app,
             congestion,
-            gateway.as_ref(),
         )
         .await?;
 
@@ -1683,10 +1472,6 @@ async fn transcribe_collected(
     let resp_body_for_parse = resp_body;
     let transcribe_ms: i64 = transcribe_ms;
     let audio_bytes: i64 = audio_bytes_used;
-    let model_name: String = match used_provider.as_str() {
-        "openai" => OPENAI_MODEL.to_string(),
-        _ => GROQ_MODEL.to_string(),
-    };
     let resp = TranscribeRespForParse { body: resp_body_for_parse };
 
     let parsed: serde_json::Value =
@@ -2907,178 +2692,39 @@ mod tests {
         }
     }
 
-    /// Gateway PoC (SSOT §4-B・R-4 対策): resolve_endpoint の env 両方セット時/片方欠け時を
-    /// 1 テスト関数内で順に検証する (std::env::set_var はプロセス全体に効くため、
-    /// 別テストと並行実行される cargo test では複数テスト関数に分けると競合しうる)。
+    /// 401/403/429 の検出は接続先 (Groq/OpenAI/カスタム) に依らない純粋関数。
     #[test]
-    fn resolve_endpoint_env_both_set_then_missing() {
-        // 他テストがこの2変数を使わない前提。テスト開始前後で必ず remove_var して隔離する。
-        std::env::remove_var("RUSHVOICE_GATEWAY_URL");
-        std::env::remove_var("RUSHVOICE_GATEWAY_TOKEN");
-
-        // ケース1: 両方セット → ゲートウェイ URL + トークンを返す
-        std::env::set_var("RUSHVOICE_GATEWAY_URL", "https://rushvoice-gateway.example.workers.dev");
-        std::env::set_var("RUSHVOICE_GATEWAY_TOKEN", "poc-token-abc");
-
-        let (groq_url, groq_key) = resolve_endpoint(
-            crate::commands::Provider::Groq,
-            GROQ_TRANSCRIBE_URL,
-            "direct-groq-key",
-        );
-        assert_eq!(
-            groq_url,
-            "https://rushvoice-gateway.example.workers.dev/groq/v1/audio/transcriptions"
-        );
-        assert_eq!(groq_key, "poc-token-abc");
-
-        let (openai_url, openai_key) = resolve_endpoint(
-            crate::commands::Provider::Openai,
-            OPENAI_TRANSCRIBE_URL,
-            "direct-openai-key",
-        );
-        assert_eq!(
-            openai_url,
-            "https://rushvoice-gateway.example.workers.dev/openai/v1/audio/transcriptions"
-        );
-        assert_eq!(openai_key, "poc-token-abc");
-
-        // ケース2: 片方だけ欠ける (TOKEN 削除) → 従来の直行 (url, key) にフォールバック
-        std::env::remove_var("RUSHVOICE_GATEWAY_TOKEN");
-        let (direct_url, direct_key) = resolve_endpoint(
-            crate::commands::Provider::Groq,
-            GROQ_TRANSCRIBE_URL,
-            "direct-groq-key",
-        );
-        assert_eq!(direct_url, GROQ_TRANSCRIBE_URL);
-        assert_eq!(direct_key, "direct-groq-key");
-
-        // Gateway ログイン追加検証: resolve_endpoint_v2 の gateway=None は
-        // 従来 resolve_endpoint に委譲され BYOK 直行になる (env 未設定状態で検証)。
-        // ⚠️ env 変数を触るテストは並行実行競合を避けるため本関数に集約する (上記コメント参照)。
-        let (v2_url, v2_key) = resolve_endpoint_v2(
-            None,
-            crate::commands::Provider::Groq,
-            GROQ_TRANSCRIBE_URL,
-            "direct-groq-key",
-        );
-        assert_eq!(v2_url, GROQ_TRANSCRIBE_URL);
-        assert_eq!(v2_key, "direct-groq-key");
-
-        // 後片付け (他テストへの影響防止)
-        std::env::remove_var("RUSHVOICE_GATEWAY_URL");
-        std::env::remove_var("RUSHVOICE_GATEWAY_TOKEN");
-    }
-
-    /// ゲートウェイ経由なら手元に OpenAI 鍵が無くても OpenAI へ回せる (hedged が動く)。
-    /// BYOK (ゲートウェイ無し) は従来どおり鍵の有無で決まる。
-    #[test]
-    fn openai_available_via_gateway_without_local_key() {
-        assert!(openai_available(None, true));
-        assert!(openai_available(Some("k"), true));
-        assert!(openai_available(Some("k"), false));
-        assert!(!openai_available(None, false));
-        // ログイン利用 + hedged ではバナーは show_in_hedged に従う
-        assert!(!should_show_congestion_banner(
-            ProviderChoice::Hedged,
-            openai_available(None, true),
-            false
-        ));
-    }
-
-    /// Gateway ログイン: resolve_endpoint_v2 は GatewayRoute=Some のとき
-    /// ログイン JWT + ゲートウェイ URL を返す (env 変数には一切依存しないため
-    /// resolve_endpoint_env_* との並行実行競合なし)。
-    #[test]
-    fn resolve_endpoint_v2_gateway_route_uses_jwt() {
-        let route = GatewayRoute {
-            base_url: "https://rushvoice-gateway.example.workers.dev/".to_string(),
-            jwt: "dummy.jwt.value".to_string(),
+    fn detect_auth_or_limit_status_matches_debug_format() {
+        let err = |status: u16| {
+            format!(
+                "transcribe failed (custom solo): {:?}",
+                crate::transcribe::TranscribeError::Http {
+                    status,
+                    body: "x".to_string()
+                }
+            )
         };
-
-        // ケース1: gateway=Some → JWT + gateway URL (末尾スラッシュは trim される)
-        let (url, key) = resolve_endpoint_v2(
-            Some(&route),
-            crate::commands::Provider::Groq,
-            GROQ_TRANSCRIBE_URL,
-            "direct-groq-key",
-        );
-        assert_eq!(
-            url,
-            "https://rushvoice-gateway.example.workers.dev/groq/v1/audio/transcriptions"
-        );
-        assert_eq!(key, "dummy.jwt.value");
-
-        let (url_o, key_o) = resolve_endpoint_v2(
-            Some(&route),
-            crate::commands::Provider::Openai,
-            OPENAI_TRANSCRIBE_URL,
-            "direct-openai-key",
-        );
-        assert_eq!(
-            url_o,
-            "https://rushvoice-gateway.example.workers.dev/openai/v1/audio/transcriptions"
-        );
-        assert_eq!(key_o, "dummy.jwt.value");
+        assert_eq!(detect_auth_or_limit_status(&err(401)), Some(401));
+        assert_eq!(detect_auth_or_limit_status(&err(403)), Some(403));
+        assert_eq!(detect_auth_or_limit_status(&err(429)), Some(429));
+        assert_eq!(detect_auth_or_limit_status(&err(500)), None);
+        assert_eq!(detect_auth_or_limit_status("network error: timeout"), None);
     }
 
-    /// Gateway ログイン: 403/429 検出の純粋関数 (設計書 A-2-4 バナー配線用)。
     #[test]
-    fn detect_entitlement_status_matches_debug_format() {
-        // TranscribeError::Http の Debug 表現を含むエラー文字列
-        let e403 = format!(
+    fn friendly_transcribe_error_tells_next_step() {
+        let e401 = format!(
             "transcribe failed (groq solo): {:?}",
-            crate::transcribe::TranscribeError::Http {
-                status: 403,
-                body: "plan_inactive".to_string()
-            }
+            crate::transcribe::TranscribeError::Http { status: 401, body: "bad key".into() }
         );
-        assert_eq!(detect_entitlement_status(&e403), Some(403));
-
+        assert!(friendly_transcribe_error(&e401).contains("APIキー"));
         let e429 = format!(
-            "transcribe failed (groq solo): {:?}",
-            crate::transcribe::TranscribeError::Http {
-                status: 429,
-                body: "quota_exceeded".to_string()
-            }
+            "hedged transcribe failed: {:?}",
+            crate::transcribe::TranscribeError::Http { status: 429, body: "rate".into() }
         );
-        assert_eq!(detect_entitlement_status(&e429), Some(429));
-
-        // 500 や通常のネットワークエラーは対象外
-        let e500 = format!(
-            "transcribe failed (groq solo): {:?}",
-            crate::transcribe::TranscribeError::Http {
-                status: 500,
-                body: "oops".to_string()
-            }
-        );
-        assert_eq!(detect_entitlement_status(&e500), None);
-        assert_eq!(detect_entitlement_status("network error: timeout"), None);
-    }
-
-    #[test]
-    fn login_expired_is_told_apart_from_plan_inactive() {
-        let expired = format!(
-            "transcribe failed (groq solo): {:?}",
-            crate::transcribe::TranscribeError::Http {
-                status: 403,
-                body: "{\"error\":\"invalid_token\"}".to_string()
-            }
-        );
-        assert!(is_login_expired_error(&expired));
-        let inactive = format!(
-            "transcribe failed (groq solo): {:?}",
-            crate::transcribe::TranscribeError::Http {
-                status: 403,
-                body: "{\"error\":\"entitlement_inactive\"}".to_string()
-            }
-        );
-        assert!(!is_login_expired_error(&inactive));
-    }
-
-    #[test]
-    fn entitlement_message_distinguishes_403_and_429() {
-        assert!(entitlement_message(403).contains("プランが無効"));
-        assert!(entitlement_message(429).contains("上限"));
+        assert!(friendly_transcribe_error(&e429).contains("利用上限"));
+        // それ以外はそのまま
+        assert_eq!(friendly_transcribe_error("network error"), "network error");
     }
 
     #[test]
@@ -3593,7 +3239,7 @@ mod tests {
     fn congestion_banner_hedged_with_key_default_suppressed() {
         // Hedged + OpenAI key 有 + show_in_hedged=false → 抑止
         // (default 動作・SSOT A-5)
-        let v = should_show_congestion_banner(ProviderChoice::Hedged, true, false);
+        let v = should_show_congestion_banner(true, false);
         assert!(!v, "hedged + key + suppressed should NOT show banner");
     }
 
@@ -3601,26 +3247,26 @@ mod tests {
     fn congestion_banner_hedged_with_key_when_show_enabled() {
         // Hedged + OpenAI key 有 + show_in_hedged=true → 表示
         // (SettingsPage で利用者が「常時表示」に切り替えた場合)
-        let v = should_show_congestion_banner(ProviderChoice::Hedged, true, true);
+        let v = should_show_congestion_banner(true, true);
         assert!(v, "hedged + key + show=true should show banner");
     }
 
     #[test]
     fn congestion_banner_hedged_without_key_treated_as_solo() {
         // Hedged 選択 + OpenAI key 無し → Groq 単独に縮退 → バナー表示
-        let v = should_show_congestion_banner(ProviderChoice::Hedged, false, false);
+        let v = should_show_congestion_banner(false, false);
         assert!(v, "hedged degraded to groq solo (no key) should show banner");
     }
 
     #[test]
     fn congestion_banner_groq_solo_shows() {
-        let v = should_show_congestion_banner(ProviderChoice::Groq, false, false);
+        let v = should_show_congestion_banner(false, false);
         assert!(v, "groq solo should show banner");
     }
 
     #[test]
     fn congestion_banner_openai_solo_shows() {
-        let v = should_show_congestion_banner(ProviderChoice::Openai, true, false);
+        let v = should_show_congestion_banner(false, false);
         assert!(v, "openai solo should show banner");
     }
 

@@ -1,0 +1,41 @@
+name: Test macOS Keychain
+
+# macOS のキーチェーン保存 (crypto/macos_impl.rs) の実機テスト。
+# 使い捨てのキーチェーンを既定にしてから、#[ignore] のテストだけを動かす。
+# macOS runner は分数 10 倍消費のため、crypto 配下を変えたときだけ動かす。
+
+"on":
+  pull_request:
+    paths:
+      - "src-tauri/src/crypto/**"
+      - ".github/workflows/test-macos-keychain.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  keychain:
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Prepare frontend dist placeholder
+        working-directory: .
+        run: mkdir -p frontend/dist && echo '<html></html>' > frontend/dist/index.html
+      - name: Use a throwaway keychain
+        run: |
+          security create-keychain -p ci-test rv-test.keychain
+          security set-keychain-settings rv-test.keychain
+          security unlock-keychain -p ci-test rv-test.keychain
+          security list-keychains -d user -s rv-test.keychain
+          security default-keychain -s rv-test.keychain
+      - name: Run keychain tests
+        run: cargo test --lib crypto::macos_impl -- --ignored --nocapture

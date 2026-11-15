@@ -34,8 +34,12 @@ fn main() {
         openai.len()
     );
 
-    // feature/gateway-login: 第 4 引数 = gateway JWT (この検証 example では未使用)
-    if let Err(e) = save_secrets(&path, Some(&groq), Some(&openai), None) {
+    let bundle = app_lib::crypto::SecretsBundle {
+        groq_api_key: Some(groq.clone()),
+        openai_api_key: Some(openai.clone()),
+        ..Default::default()
+    };
+    if let Err(e) = save_secrets(&path, &bundle) {
         eprintln!("[Day5-DPAPI] FAIL save_secrets: {:?}", e);
         std::process::exit(1);
     }

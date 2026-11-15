@@ -15,7 +15,8 @@ export type { AppRule } from '../types/app_rule'
 export type { GlossaryEntry, OverlapResult } from '../types/glossary'
 export type { Profile, EmojiDensity } from '../types/profile'
 
-export type Provider = 'groq' | 'openai'
+/** キーの保存先。カスタム接続先 (OpenAI 互換) は文字起こし用と整文用で別々に持つ。 */
+export type Provider = 'groq' | 'openai' | 'custom_transcribe' | 'custom_llm'
 
 export interface ApiKeyTestResult {
   ok: boolean
@@ -61,6 +62,39 @@ export async function testStoredApiKey(
   provider: Provider,
 ): Promise<ApiKeyTestResult> {
   return await invoke<ApiKeyTestResult>('test_stored_api_key', { provider })
+}
+
+/// カスタム接続先を、入力中のベース URL で試す ({base}/models に GET)。
+/// key が空なら保存済みのキー (無ければキー無し) を使う。
+export async function testEndpointUrl(
+  provider: Provider,
+  baseUrl: string,
+  key: string | null,
+): Promise<ApiKeyTestResult> {
+  return await invoke<ApiKeyTestResult>('test_endpoint_url', { provider, baseUrl, key })
+}
+
+// ----- 接続先の設定キー (settings_kv・Rust 側 endpoints.rs と 1:1) -----
+
+/** 文字起こしの接続先: hedged / groq / openai / custom */
+export const TRANSCRIBE_PROVIDER_KEY = 'provider'
+export const CUSTOM_TRANSCRIBE_BASE_URL_KEY = 'custom_transcribe_base_url'
+export const CUSTOM_TRANSCRIBE_MODEL_KEY = 'custom_transcribe_model'
+/** 整文・字幕翻訳・議事録整形の接続先: groq / openai / custom */
+export const LLM_PROVIDER_KEY = 'llm_provider'
+export const CUSTOM_LLM_BASE_URL_KEY = 'custom_llm_base_url'
+export const CUSTOM_LLM_MODEL_KEY = 'custom_llm_model'
+
+// ----- 旧版の有料アカウント (ゲートウェイ) 終了の案内 (2026-11-15) -----
+
+/// 旧版でログインしていた利用者に「自分のキーか接続先を設定してください」と出すか。
+export async function getGatewayRetiredNotice(): Promise<boolean> {
+  return await invoke<boolean>('get_gateway_retired_notice')
+}
+
+/// 案内を閉じる (以後出さない)。
+export async function dismissGatewayRetiredNotice(): Promise<void> {
+  await invoke('dismiss_gateway_retired_notice')
 }
 
 // ----- 録音セッション (Stage 2-A) -----
@@ -495,91 +529,6 @@ export async function getCongestionConfig(): Promise<CongestionConfig> {
 /// 設定値を保存。範囲外 (< 1000 or > 30000) は Rust 側でクランプされる。
 export async function setCongestionConfig(cfg: CongestionConfig): Promise<void> {
   await invoke('set_congestion_config', { cfg })
-}
-
-// ----- Gateway ログイン (feature/gateway-login) -----
-//
-// 設計 SSOT: 内部設計メモ §A-2
-// Rust 側 src-tauri/src/gateway_auth.rs と 1:1 対応。
-//
-// イベント:
-//   - 'gateway:auth-changed' (payload: GatewayStatus)
-//       ログイン成功 / ログアウト時に Rust 側から emit される (L145: invoke + emit 二重通知)。
-//       SettingsPage の AccountSection が listen する。
-//   - 'gateway:entitlement-error' (payload: { status: number, message: string })
-//       ゲートウェイ経由の転写で 403/429 を受けたとき。
-//       GatewayEntitlementBanner.tsx が listen する (L337: alert 禁止・インラインバナー)。
-
-export interface GatewayStatus {
-  /** logged_out=JWT 未保存 / active=有効 / expired=JWT 失効 (再ログイン要) / error=一時エラー */
-  state: 'logged_out' | 'active' | 'expired' | 'error'
-  email: string | null
-  /** 'trial' 等 */
-  plan: string | null
-  /** 'active' 等 (entitlement.status) */
-  status: string | null
-  /** RFC3339 (プラン有効期限) */
-  current_period_end: string | null
-  message: string | null
-}
-
-export interface GatewayEntitlementError {
-  status: number
-  /// 'login_expired' = ログイン切れ (再ログインで直る・購入は不要) / 'entitlement' = 契約・上限
-  reason?: 'login_expired' | 'entitlement'
-  message: string
-}
-
-/// メールにワンタイムコード (6 桁・10 分有効) を送付する。
-export async function gatewayRequestCode(email: string): Promise<void> {
-  await invoke('gateway_request_code', { email })
-}
-
-/// コードを検証してログイン。成功時: JWT 保存 + 転写経路が gateway に自動切替。
-export async function gatewayVerifyCode(
-  email: string,
-  code: string,
-): Promise<GatewayStatus> {
-  return await invoke<GatewayStatus>('gateway_verify_code', { email, code })
-}
-
-/// 保存済 JWT で現在の認証状態を取得 (JWT 未保存なら logged_out)。
-export async function gatewayStatus(): Promise<GatewayStatus> {
-  return await invoke<GatewayStatus>('gateway_status')
-}
-
-/// ログアウト: JWT 削除 + 転写経路が byok に戻る。
-export async function gatewayLogout(): Promise<void> {
-  await invoke('gateway_logout')
-}
-
-/** アプリから購入できるプラン (ゲートウェイの `plan` と 1:1)。 */
-export type PurchasablePlan = 'standard' | 'pro'
-
-/** 購入導線の表示用メタ (価格は 2026-07-27 決定)。 */
-export const PLAN_CATALOG: { plan: PurchasablePlan; label: string; price: string }[] = [
-  { plan: 'standard', label: 'スタンダード', price: '¥980/月' },
-  { plan: 'pro', label: 'プロ', price: '¥1,980/月' },
-]
-
-/// Stripe Checkout を既定ブラウザで開く。戻り値は開いた URL (手動コピー用)。
-/// 要ログイン (JWT は Rust 側に留まり frontend へは渡らない)。
-export async function gatewayOpenCheckout(plan: PurchasablePlan): Promise<string> {
-  return await invoke<string>('gateway_open_checkout', { plan })
-}
-
-/** 上位プラン限定機能 (議事録 / セミナー字幕) の利用可否。 */
-export interface ProFeatureAccess {
-  allowed: boolean
-  /** 判定に使ったプラン (未ログインなら null) */
-  plan: string | null
-  /** false = BYOK 運用 (未ログイン) */
-  logged_in: boolean
-}
-
-/// プラン別ゲートの判定 (config_db の写しで即時に返る・ネットワーク待ちなし)。
-export async function gatewayProFeatureAccess(): Promise<ProFeatureAccess> {
-  return await invoke<ProFeatureAccess>('gateway_pro_feature_access')
 }
 
 // Day 25 Phase 2-G: ASR 補正レイヤー (alias_db / EditDiff / applyAliasFromEditDiff) は

@@ -3,12 +3,11 @@
 // 仕様: 内部設計メモ
 // - get_setting / set_setting        ... settings_kv (config_db)
 // - save_api_key / has_api_key / delete_api_key ... DPAPI 暗号化 (crypto)
-// - test_api_key                     ... Groq / OpenAI に軽い ping (5 秒 timeout)
+// - test_api_key / test_endpoint_url ... 接続先の /models に軽い ping (5 秒 timeout)
 //
 // エラーは String にフラット化して invoke で扱いやすくする (Tauri 2.x 標準)。
 
 use std::sync::Mutex;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -33,18 +32,53 @@ use crate::{ActiveProfileKey, HookHolder};
 /// Phase 2 A: アクティブプロファイルのキー定数 (config_db KV)
 const ACTIVE_PROFILE_KEY_KV: &str = "active_profile_key";
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// キーの保存先。カスタム接続先は文字起こし用と整文用で別々に持つ
+/// (例: 文字起こしは手元の whisper.cpp、整文は Groq、のような組み合わせを許す)。
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Provider {
     Groq,
     Openai,
+    CustomTranscribe,
+    CustomLlm,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ApiKeyTestResult {
-    pub ok: bool,
-    pub status: Option<u16>,
-    pub message: String,
+impl Provider {
+    fn slot(self, b: &mut crate::crypto::SecretsBundle) -> &mut Option<String> {
+        match self {
+            Provider::Groq => &mut b.groq_api_key,
+            Provider::Openai => &mut b.openai_api_key,
+            Provider::CustomTranscribe => &mut b.custom_transcribe_api_key,
+            Provider::CustomLlm => &mut b.custom_llm_api_key,
+        }
+    }
+
+    /// 接続テストに使うベース URL。カスタムは保存済みの設定から読む。
+    fn base_url(self) -> String {
+        match self {
+            Provider::Groq => crate::endpoints::GROQ_BASE_URL.to_string(),
+            Provider::Openai => crate::endpoints::OPENAI_BASE_URL.to_string(),
+            Provider::CustomTranscribe | Provider::CustomLlm => {
+                let key = if self == Provider::CustomTranscribe {
+                    crate::endpoints::CUSTOM_TRANSCRIBE_BASE_URL_KEY
+                } else {
+                    crate::endpoints::CUSTOM_LLM_BASE_URL_KEY
+                };
+                ConfigDb::open(&default_config_db_path())
+                    .ok()
+                    .and_then(|db| db.get_kv(key).ok().flatten())
+                    .unwrap_or_default()
+            }
+        }
+    }
+}
+
+pub type ApiKeyTestResult = crate::endpoints::EndpointTestResult;
+
+fn load_bundle() -> Result<crate::crypto::SecretsBundle, String> {
+    Ok(load_secrets(&default_secrets_path())
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default())
 }
 
 // ----- settings_kv -----
@@ -148,102 +182,84 @@ pub fn apply_mic_standby(app: AppHandle) -> Result<(), String> {
 // ----- API キー (DPAPI 暗号化) -----
 
 /// 既存ファイルを読み出し、指定 provider のみ key で上書きして再保存する。
-/// もう片方の key は復号 → 再暗号化されるが、平文は invoke 境界を越えず Rust 内で完結する。
+/// 他のキーは復号 → 再暗号化されるが、平文は invoke 境界を越えず Rust 内で完結する。
 #[tauri::command]
 pub fn save_api_key(provider: Provider, key: String) -> Result<(), String> {
-    let path = default_secrets_path();
-    let existing = load_secrets(&path)
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    let (groq, openai) = match provider {
-        Provider::Groq => (Some(key.as_str()), existing.openai_api_key.as_deref()),
-        Provider::Openai => (existing.groq_api_key.as_deref(), Some(key.as_str())),
-    };
-    // Gateway ログイン: 保存済 JWT は温存する (BYOK キー更新でログアウトさせない)
-    save_secrets(&path, groq, openai, existing.gateway_jwt.as_deref()).map_err(|e| e.to_string())
+    let mut bundle = load_bundle()?;
+    let key = key.trim().to_string();
+    *provider.slot(&mut bundle) = if key.is_empty() { None } else { Some(key) };
+    save_secrets(&default_secrets_path(), &bundle).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn has_api_key(provider: Provider) -> Result<bool, String> {
-    let path = default_secrets_path();
-    let bundle = load_secrets(&path)
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    Ok(match provider {
-        Provider::Groq => bundle.groq_api_key.is_some(),
-        Provider::Openai => bundle.openai_api_key.is_some(),
-    })
+    let mut bundle = load_bundle()?;
+    Ok(provider.slot(&mut bundle).is_some())
 }
 
 #[tauri::command]
 pub fn delete_api_key(provider: Provider) -> Result<(), String> {
-    let path = default_secrets_path();
-    let bundle = load_secrets(&path)
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    let (groq, openai) = match provider {
-        Provider::Groq => (None, bundle.openai_api_key.as_deref()),
-        Provider::Openai => (bundle.groq_api_key.as_deref(), None),
-    };
-    // Gateway ログイン: 保存済 JWT は温存する (BYOK キー削除でログアウトさせない)
-    save_secrets(&path, groq, openai, bundle.gateway_jwt.as_deref()).map_err(|e| e.to_string())
+    let mut bundle = load_bundle()?;
+    *provider.slot(&mut bundle) = None;
+    save_secrets(&default_secrets_path(), &bundle).map_err(|e| e.to_string())
 }
 
-// ----- API ping -----
-
-async fn ping_api(provider: Provider, key: &str) -> Result<ApiKeyTestResult, String> {
-    let url = match provider {
-        Provider::Groq => "https://api.groq.com/openai/v1/models",
-        Provider::Openai => "https://api.openai.com/v1/models",
-    };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| e.to_string())?;
-    match client
-        .get(url)
-        .header("Authorization", format!("Bearer {}", key))
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            let status = resp.status();
-            Ok(ApiKeyTestResult {
-                ok: status.is_success(),
-                status: Some(status.as_u16()),
-                message: if status.is_success() {
-                    "OK".into()
-                } else {
-                    format!("HTTP {}", status.as_u16())
-                },
-            })
-        }
-        Err(e) => Ok(ApiKeyTestResult {
-            ok: false,
-            status: None,
-            message: format!("接続失敗: {}", e),
-        }),
-    }
-}
+// ----- 接続テスト ({base}/models に軽く GET) -----
 
 #[tauri::command]
 pub async fn test_api_key(provider: Provider, key: String) -> Result<ApiKeyTestResult, String> {
-    ping_api(provider, &key).await
+    Ok(crate::endpoints::test_endpoint(&provider.base_url(), &key).await)
 }
 
-/// 保存済み API キーを復号して ping する。入力欄が空でもテストできるようにする UX 補助。
+/// 保存済み API キーで試す。入力欄が空でもテストできるようにする UX 補助。
+/// カスタム接続先はキーが無くてもよい (ローカルサーバー)。
 #[tauri::command]
 pub async fn test_stored_api_key(provider: Provider) -> Result<ApiKeyTestResult, String> {
-    let path = default_secrets_path();
-    let bundle = load_secrets(&path)
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    let key = match provider {
-        Provider::Groq => bundle.groq_api_key,
-        Provider::Openai => bundle.openai_api_key,
+    let mut bundle = load_bundle()?;
+    let key = provider.slot(&mut bundle).clone();
+    let key = match (provider, key) {
+        (_, Some(k)) => k,
+        (Provider::CustomTranscribe | Provider::CustomLlm, None) => String::new(),
+        (_, None) => return Err("保存済みキーがありません".to_string()),
     };
-    let key = key.ok_or_else(|| "保存済みキーがありません".to_string())?;
-    ping_api(provider, &key).await
+    Ok(crate::endpoints::test_endpoint(&provider.base_url(), &key).await)
+}
+
+/// カスタム接続先を、画面に入力中の URL で試す (保存前でも試せるように)。
+/// key が空なら保存済みのキー (無ければキー無し) を使う。
+#[tauri::command]
+pub async fn test_endpoint_url(
+    provider: Provider,
+    base_url: String,
+    key: Option<String>,
+) -> Result<ApiKeyTestResult, String> {
+    let key = match key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()) {
+        Some(k) => k,
+        None => {
+            let mut bundle = load_bundle()?;
+            provider.slot(&mut bundle).clone().unwrap_or_default()
+        }
+    };
+    Ok(crate::endpoints::test_endpoint(&base_url, &key).await)
+}
+
+/// 旧版の有料アカウント (ゲートウェイ) 終了の案内を出すか。
+#[tauri::command]
+pub fn get_gateway_retired_notice() -> Result<bool, String> {
+    let db = ConfigDb::open(&default_config_db_path()).map_err(|e| e.to_string())?;
+    Ok(db
+        .get_kv(crate::endpoints::GATEWAY_RETIRED_NOTICE_KEY)
+        .map_err(|e| e.to_string())?
+        .as_deref()
+        == Some("1"))
+}
+
+/// 案内を閉じる (以後出さない)。
+#[tauri::command]
+pub fn dismiss_gateway_retired_notice() -> Result<(), String> {
+    let db = ConfigDb::open(&default_config_db_path()).map_err(|e| e.to_string())?;
+    db.set_kv(crate::endpoints::GATEWAY_RETIRED_NOTICE_KEY, "0")
+        .map_err(|e| e.to_string())
 }
 
 // ----- 録音セッション (Stage 2-A・Stage 2-C-2 で波形 emit 追加) -----
@@ -286,28 +302,8 @@ pub async fn stop_recording(
     app: AppHandle,
     holder: State<'_, RecorderHolder>,
 ) -> Result<String, String> {
-    // Gateway ログイン: 転写経路モード (byok/gateway) を先に解決する。
-    // gateway モード時は BYOK Groq キー未設定でも録音を許可する
-    // (経路 URL/Bearer は resolve_endpoint_v2 がゲートウェイ + JWT に差し替えるため)。
-    let gateway_route = crate::load_gateway_route_opt();
-
-    // 保存済み Groq キーを取得 (Stage 2-A は Groq 単独固定)
-    let path = default_secrets_path();
-    let bundle = load_secrets(&path)
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    let api_key = match bundle.groq_api_key {
-        Some(k) => k,
-        None if gateway_route.is_some() => {
-            log::info!("[gateway] BYOK Groq key absent; proceeding via gateway route");
-            String::new()
-        }
-        None => {
-            return Err(
-                "Groq API キーが未設定です (設定画面で保存してください)".to_string()
-            )
-        }
-    };
+    // 接続先 (Groq / OpenAI / カスタム) を先に決める。未設定なら録音を書き起こせないので止める。
+    let setup = crate::endpoints::load_transcribe_setup()?;
 
     // v0.1.3 patch2 (C): GlossaryDb から固有名詞を fetch して Whisper prompt 末尾に注入。
     // best-effort: 取得失敗 / state 未管理は空 Vec で続行 (従来通り固定 prompt 動作)。
@@ -326,19 +322,14 @@ pub async fn stop_recording(
     // Day 25 Phase 2-G (SSOT v3.3): multi pipeline 経路削除に伴い legacy 直接呼出に簡素化
     // v0.1.9 (Day 28): hedged 本番配線。provider 設定 + OpenAI key を読み込んで stop_session_and_transcribe に渡す
     // v0.1.10 機能 A: 混雑バナー設定を config_db から読み込んで recorder に渡す
-    let provider_choice = crate::load_provider_choice();
-    let openai_key = crate::load_openai_key_opt();
     let congestion = load_congestion_config_or_default();
     match stop_session_and_transcribe(
         &holder,
-        api_key.clone(),
-        openai_key,
-        provider_choice,
+        setup,
         glossary_words,
         glossary_entries,
         Some(app.clone()),
         congestion,
-        gateway_route,
     ).await {
         Ok(outcome) => {
             // 2026-07-25: LLM 後処理後テキスト (履歴 refined_text 用)。後処理を通らない経路では None。
@@ -353,7 +344,7 @@ pub async fn stop_recording(
                 );
             } else if !outcome.text.is_empty() {
                 // Phase 2 A: アクティブプロファイルで LLM 後処理
-                let final_text = apply_profile_postprocess(&app, &api_key, &outcome.text).await;
+                let final_text = apply_profile_postprocess(&app, &outcome.text).await;
                 // L058: clipboard コピー → SendInput(Ctrl+V) でアクティブアプリにペースト (PA-02)
                 if let Err(e) = crate::clipboard::paste_or_type_text(&final_text) {
                     log::warn!("[paste] failed: {}", e);
@@ -1098,11 +1089,7 @@ pub fn set_active_profile_key(
 /// - LLM 呼び出し失敗・空レスポンスは `text` をフォールバック返却
 ///
 /// lib.rs のホットキーイベントハンドラと stop_recording command の両経路から共通呼出。
-pub(crate) async fn apply_profile_postprocess(
-    app: &AppHandle,
-    api_key: &str,
-    text: &str,
-) -> String {
+pub(crate) async fn apply_profile_postprocess(app: &AppHandle, text: &str) -> String {
     // アクティブプロファイルキーを取得
     let active_key = match app.try_state::<ActiveProfileKey>() {
         Some(s) => s.0.lock().unwrap_or_else(|p| p.into_inner()).clone(),
@@ -1154,6 +1141,15 @@ pub(crate) async fn apply_profile_postprocess(
         return text.to_string();
     }
 
+    // 整文の接続先 (Groq / OpenAI / カスタム)。未設定なら整えずにそのまま貼る (録音の流れは止めない)。
+    let endpoint = match crate::endpoints::load_chat_endpoint() {
+        Ok(ep) => ep,
+        Err(e) => {
+            log::warn!("[llm_postprocess] skipped: {}", e);
+            return text.to_string();
+        }
+    };
+
     // reqwest Client を都度生成 (transcribe.rs の build_client と同じ設定)
     let client = match crate::transcribe::build_client() {
         Ok(c) => c,
@@ -1189,7 +1185,7 @@ pub(crate) async fn apply_profile_postprocess(
     let allow_style_change = allow_template_expansion || active_key == "business_doc";
     apply_llm_postprocess(
         &client,
-        api_key,
+        &endpoint,
         &prompt,
         text,
         &crate::llm_postprocess::PostprocessOptions {
@@ -1198,8 +1194,6 @@ pub(crate) async fn apply_profile_postprocess(
             allow_template_expansion,
             allow_style_change,
         },
-        // gateway ログイン中は後処理も gateway 経由 (未ログインなら None = 従来の BYOK)
-        crate::load_gateway_route_opt().as_ref(),
     )
     .await
 }
@@ -1699,6 +1693,10 @@ mod tests {
         matches!(g, Provider::Groq);
         let o: Provider = serde_json::from_str("\"openai\"").unwrap();
         matches!(o, Provider::Openai);
+        let c: Provider = serde_json::from_str("\"custom_transcribe\"").unwrap();
+        assert_eq!(c, Provider::CustomTranscribe);
+        let l: Provider = serde_json::from_str("\"custom_llm\"").unwrap();
+        assert_eq!(l, Provider::CustomLlm);
     }
 
     // Day 25 Phase 2-G (SSOT v3.3): EditDiff / DuplicateAction / EditDiffApplyResult

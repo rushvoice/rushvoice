@@ -12,8 +12,9 @@
 //   - LLM が返したテキストが空の場合は元の text をフォールバック返却
 //   - API 呼び出し失敗時もログ警告 + 元テキストをフォールバック返却 (録音フローを止めない)
 //
-// エンドポイント: https://api.groq.com/openai/v1/chat/completions
-// モデル: llama-3.3-70b-versatile
+// 接続先: endpoints::ChatEndpoint (Groq / OpenAI / OpenAI 互換のカスタム・ローカル LLM 可)
+//   既定は Groq の llama-3.3-70b-versatile。プロンプト・ガード (伸長・欠落・依頼の保持) と
+//   429 の扱いは接続先に依らず同じに効く。
 // タイムアウト: 10 秒
 
 use serde::{Deserialize, Serialize};
@@ -41,7 +42,7 @@ struct ChatCompletionResponse {
 
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
-    model: &'a str,
+    model: String,
     messages: Vec<ChatRequestMessage<'a>>,
     max_tokens: u32,
     temperature: f32,
@@ -133,52 +134,13 @@ pub fn build_system_prompt(
     )
 }
 
-/// プロファイルの LLM 後処理プロンプトで text を整形して返す。
-///
-/// - `system_prompt`: profile.llm_postprocess_prompt (空の場合は呼ばない想定だが空でも安全に動作)
-/// - `text`: Whisper 文字起こし結果
-/// - `emoji_density`: 絵文字密度 ('none'|'few'|'normal'|'many')
-///
-/// `emoji_density` に応じた絵文字指示を `system_prompt` の末尾 (JAPANESE_ONLY_SUFFIX の前) に挿入する。
-/// `raw` プロファイル (system_prompt が空) は LLM を呼ばないため `emoji_density` は影響しない。
-///
-/// エラー発生時・LLM が空テキストを返した場合は `text` をそのまま返す (フォールバック)。
-const GROQ_CHAT_COMPLETIONS_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
-
-/// 後処理 LLM の宛先解決 (2026-07-27・外販ブロッカー対応)。
-///
-/// 転写だけがゲートウェイ経由で、後処理は Groq 直叩きのままだった。
-/// この状態で外販すると「高精度の正体」である LLM 後処理 (L339) が
-/// ユーザー自身の Groq キー無しでは動かず、競合に対する優位が提供できない。
-///
-/// gateway 側は `/groq/` の汎用プロキシなのでサーバ実装の追加は不要。
-/// L294 に従い検証済みの本体へ分岐を混ぜず、純粋関数として切り出す。
-/// トークン値そのものはログしない (base URL + path のみ)。
-pub fn resolve_chat_completions_endpoint(
-    gateway: Option<&crate::recorder::GatewayRoute>,
-    direct_key: &str,
-) -> (String, String) {
-    if let Some(g) = gateway {
-        let base = g.base_url.trim_end_matches('/');
-        let url = format!("{}/groq/v1/chat/completions", base);
-        log::info!("[gateway] llm_postprocess route active: {}", url);
-        return (url, g.jwt.clone());
-    }
-    (
-        GROQ_CHAT_COMPLETIONS_URL.to_string(),
-        direct_key.to_string(),
-    )
-}
-
-/// 既定モデル。指示の数が多い清書プロンプトを最も忠実に守る。
-const PRIMARY_MODEL: &str = "llama-3.3-70b-versatile";
-
-/// 2026-07-25 指摘: 無料枠の日次トークン上限 (TPD) を使い切ると後処理が丸ごと止まり、
-/// 素の Whisper 出力が貼られて「精度が落ちた」ように見える (L583 と同じ見え方)。
-/// 上限に当たったら**品質は落ちても止めない**ため、日次枠の大きい小型モデルへ退避する。
-/// 既定を小型に変えないのは、指示追従の弱さで創作・語尾変換の事故が増えるため
-/// (伸長ガードと max_tokens は最後の網であって品質の担保ではない・L582)。
-const FALLBACK_MODEL: &str = "llama-3.1-8b-instant";
+// 宛先・キー・モデルは endpoints::resolve_chat_endpoint が決める (2026-11-15: ゲートウェイ終了・
+// カスタム接続先対応)。既定 (Groq) のモデルを小型にしないのは、指示追従の弱さで創作・語尾変換の
+// 事故が増えるため (伸長ガードと max_tokens は最後の網であって品質の担保ではない・L582)。
+// 2026-07-25 指摘: 無料枠の日次トークン上限 (TPD) を使い切ると後処理が丸ごと止まり、
+// 素の Whisper 出力が貼られて「精度が落ちた」ように見える (L583 と同じ見え方)。
+// 上限に当たったら**品質は落ちても止めない**ため、退避先 (ChatEndpoint.fallback_model) がある
+// 接続先では日次枠の大きい小型モデルへ退避する。
 
 /// これを超える Retry-After は「日次上限の枯渇」とみなし、待たずに原文へフォールバックする。
 /// 発話ごとの後処理で数十秒待たせるのは体感を壊すため短く取る。
@@ -220,9 +182,14 @@ pub fn should_retry_rate_limit(status: u16, retry_after: Option<f64>, attempt: u
 }
 
 /// 429 で待っても復帰しない (= 日次枠の枯渇) とき、小型モデルへ退避してよいかを判定する。
+/// 退避先が無い接続先 (OpenAI・カスタム) では退避しない。
 /// 退避は 1 度きり。既にフォールバック中なら諦めて原文を返す (L294: 純粋関数)。
-pub fn should_switch_to_fallback_model(status: u16, current_model: &str) -> bool {
-    status == 429 && current_model != FALLBACK_MODEL
+pub fn should_switch_to_fallback_model(
+    status: u16,
+    current_model: &str,
+    fallback_model: Option<&str>,
+) -> bool {
+    matches!(fallback_model, Some(f) if status == 429 && current_model != f)
 }
 
 /// 後処理の振る舞いを決めるプロファイル由来の設定。
@@ -244,16 +211,24 @@ pub struct PostprocessOptions {
     pub allow_style_change: bool,
 }
 
+/// プロファイルの LLM 後処理プロンプトで text を整形して返す。
+///
+/// - `endpoint`: 接続先 (endpoints::load_chat_endpoint)
+/// - `system_prompt`: profile.llm_postprocess_prompt (空の場合は呼ばない想定だが空でも安全に動作)
+/// - `text`: Whisper 文字起こし結果
+/// - `emoji_density`: 絵文字密度 ('none'|'few'|'normal'|'many')
+///
+/// `emoji_density` に応じた絵文字指示を `system_prompt` の末尾 (JAPANESE_ONLY_SUFFIX の前) に挿入する。
+/// `raw` プロファイル (system_prompt が空) は LLM を呼ばないため `emoji_density` は影響しない。
+///
+/// エラー発生時・LLM が空テキストを返した場合は `text` をそのまま返す (フォールバック)。
 pub async fn apply_llm_postprocess(
     client: &reqwest::Client,
-    api_key: &str,
+    endpoint: &crate::endpoints::ChatEndpoint,
     system_prompt: &str,
     text: &str,
     opts: &PostprocessOptions,
-    gateway: Option<&crate::recorder::GatewayRoute>,
 ) -> String {
-    // 宛先と資格情報を先に確定する (gateway ログイン時は JWT・未ログイン時は BYOK キー)。
-    let (endpoint_url, auth_token) = resolve_chat_completions_endpoint(gateway, api_key);
     let PostprocessOptions {
         emoji_density,
         filler_removal,
@@ -275,7 +250,7 @@ pub async fn apply_llm_postprocess(
     let full_system = build_system_prompt(system_prompt, emoji_density, filler_removal);
 
     let mut request = ChatRequest {
-        model: PRIMARY_MODEL,
+        model: endpoint.model.clone(),
         messages: vec![
             ChatRequestMessage {
                 role: "system",
@@ -302,9 +277,7 @@ pub async fn apply_llm_postprocess(
     let mut attempt: u32 = 0;
     let resp = loop {
         attempt += 1;
-        let r = match client
-            .post(&endpoint_url)
-            .header("Authorization", format!("Bearer {}", auth_token))
+        let r = match crate::endpoints::with_auth(client.post(&endpoint.url), &endpoint.api_key)
             .header("Content-Type", "application/json")
             .json(&request)
             .send()
@@ -328,8 +301,9 @@ pub async fn apply_llm_postprocess(
         let reset_tokens = header_string(r.headers(), "x-ratelimit-reset-tokens");
         let body = r.text().await.unwrap_or_default();
         log::warn!(
-            "[llm_postprocess] HTTP {} (attempt {}): retry_after={:?} remaining_tokens={:?} remaining_requests={:?} reset_tokens={:?} body={}",
+            "[llm_postprocess] HTTP {} from {} (attempt {}): retry_after={:?} remaining_tokens={:?} remaining_requests={:?} reset_tokens={:?} body={}",
             status,
+            endpoint.label,
             attempt,
             retry_after,
             remaining_tokens,
@@ -348,13 +322,15 @@ pub async fn apply_llm_postprocess(
         }
         // 待っても復帰しない 429 = 日次枠の枯渇。後処理を丸ごと諦めるより、
         // 小型モデルで続行するほうが実害が小さい (素の Whisper 出力が貼られるのを防ぐ)。
-        if should_switch_to_fallback_model(status.as_u16(), request.model) {
+        let fallback = endpoint.fallback_model.as_deref();
+        if should_switch_to_fallback_model(status.as_u16(), &request.model, fallback) {
+            let fb = fallback.unwrap_or_default().to_string();
             log::warn!(
                 "[llm_postprocess] daily quota exhausted on {}; falling back to {}",
                 request.model,
-                FALLBACK_MODEL
+                fb
             );
-            request.model = FALLBACK_MODEL;
+            request.model = fb;
             continue;
         }
         return text.to_string();
@@ -468,7 +444,8 @@ pub async fn apply_llm_postprocess(
     }
 
     log::info!(
-        "[llm_postprocess] OK: model={} original_len={} result_len={}",
+        "[llm_postprocess] OK: endpoint={} model={} original_len={} result_len={}",
+        endpoint.label,
         request.model,
         text.len(),
         result.len()
@@ -926,12 +903,16 @@ mod tests {
     #[test]
     fn test_should_switch_to_fallback_model() {
         // 既定モデルで 429 → 小型モデルへ退避する
-        assert!(should_switch_to_fallback_model(429, PRIMARY_MODEL));
+        use crate::endpoints::{GROQ_CHAT_FALLBACK_MODEL as FALLBACK_MODEL, GROQ_CHAT_MODEL as PRIMARY_MODEL};
+        let fb = Some(FALLBACK_MODEL);
+        assert!(should_switch_to_fallback_model(429, PRIMARY_MODEL, fb));
+        // 退避先が無い接続先 (OpenAI・カスタム) では切り替えない
+        assert!(!should_switch_to_fallback_model(429, "qwen2.5:7b", None));
         // 既に小型モデル → これ以上退避先がないので諦める (無限ループ防止)
-        assert!(!should_switch_to_fallback_model(429, FALLBACK_MODEL));
+        assert!(!should_switch_to_fallback_model(429, FALLBACK_MODEL, fb));
         // 429 以外は退避しない (キー不正・障害はモデルを変えても直らない)
-        assert!(!should_switch_to_fallback_model(401, PRIMARY_MODEL));
-        assert!(!should_switch_to_fallback_model(500, PRIMARY_MODEL));
+        assert!(!should_switch_to_fallback_model(401, PRIMARY_MODEL, fb));
+        assert!(!should_switch_to_fallback_model(500, PRIMARY_MODEL, fb));
         // 退避先は既定と別モデルであること (定数の取り違え防止)
         assert_ne!(PRIMARY_MODEL, FALLBACK_MODEL);
     }
@@ -1218,28 +1199,103 @@ mod tests {
         assert!(!is_polite_ending("いい感じだね"));
     }
 
-    /// 2026-07-27 外販ブロッカー: 転写だけ gateway 経由で、後処理は Groq 直叩きのままだった。
-    /// gateway ログイン時は後処理も gateway へ向き、JWT が使われることを固定する。
-    #[test]
-    fn chat_endpoint_uses_gateway_when_logged_in() {
-        let route = crate::recorder::GatewayRoute {
-            base_url: "https://example.workers.dev/".to_string(),
-            jwt: "jwt.value".to_string(),
-        };
-        let (url, token) = resolve_chat_completions_endpoint(Some(&route), "byok-key");
-        assert_eq!(
-            url, "https://example.workers.dev/groq/v1/chat/completions",
-            "末尾スラッシュを重複させずに /groq/ プロキシへ向くこと"
-        );
-        assert_eq!(token, "jwt.value", "BYOK キーではなく JWT を使うこと");
+    /// テスト用の最小 OpenAI 互換サーバー (ローカル LLM の代わり)。
+    /// 1 リクエストを受けて、受け取った生リクエストを返しつつ、決めた content で応答する。
+    async fn serve_once(content: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            // ヘッダと本文 (Content-Length 分) を読む
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(pos) = text.find("\r\n\r\n") {
+                    let len = text[..pos]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= pos + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let body = serde_json::json!({
+                "choices": [{"message": {"content": content}, "finish_reason": "stop"}]
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&buf).to_string()
+        });
+        (base, handle)
     }
 
-    /// 未ログイン (gateway=None) では従来どおり Groq 直行・BYOK キーのまま。
-    /// 既存ユーザーの挙動を変えないことが移行の前提 (合格条件5)。
-    #[test]
-    fn chat_endpoint_falls_back_to_byok_when_logged_out() {
-        let (url, token) = resolve_chat_completions_endpoint(None, "byok-key");
-        assert_eq!(url, GROQ_CHAT_COMPLETIONS_URL);
-        assert_eq!(token, "byok-key");
+    fn local_endpoint(base: &str) -> crate::endpoints::ChatEndpoint {
+        crate::endpoints::resolve_chat_endpoint(
+            crate::endpoints::LlmProvider::Custom,
+            &crate::crypto::SecretsBundle::default(),
+            &crate::endpoints::CustomEndpointConfig {
+                base_url: base.to_string(),
+                model: "local-model".to_string(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn opts() -> PostprocessOptions {
+        PostprocessOptions {
+            emoji_density: "none".into(),
+            filler_removal: true,
+            allow_template_expansion: false,
+            allow_style_change: false,
+        }
+    }
+
+    /// ローカル LLM (キー無し) でも整文が使え、Authorization を送らず、指定のモデル名で呼ぶ。
+    #[tokio::test]
+    async fn custom_local_endpoint_is_used_without_key() {
+        let (base, server) = serve_once("明日は会議です。").await;
+        let client = reqwest::Client::new();
+        let out = apply_llm_postprocess(&client, &local_endpoint(&base), "整える", "明日は会議です", &opts()).await;
+        assert_eq!(out, "明日は会議です。");
+        let raw = server.await.unwrap();
+        assert!(raw.starts_with("POST /v1/chat/completions"), "got: {}", &raw[..40.min(raw.len())]);
+        assert!(!raw.to_ascii_lowercase().contains("authorization:"), "キーが空なら Authorization を送らない");
+        assert!(raw.contains("\"model\":\"local-model\""));
+    }
+
+    /// 伸長ガードは接続先に依らず効く: ローカル LLM が創作した長文は原文へ戻す。
+    #[tokio::test]
+    async fn expansion_guard_applies_to_custom_endpoint() {
+        let fabricated = "明日は会議です。会議の進め方について詳しく説明します。まず議題を共有し、次に担当者を決め、最後に期限を確認しましょう。資料は前日までに用意してください。";
+        let (base, server) = serve_once(fabricated).await;
+        let client = reqwest::Client::new();
+        let out = apply_llm_postprocess(&client, &local_endpoint(&base), "整える", "明日は会議です", &opts()).await;
+        assert_eq!(out, "明日は会議です", "創作された長文は採用しない");
+        let _ = server.await;
+    }
+
+    /// つながらない接続先 (ローカルサーバーが止まっている) でも録音の流れを止めず原文を返す。
+    #[tokio::test]
+    async fn unreachable_endpoint_falls_back_to_original() {
+        let client = reqwest::Client::new();
+        let out = apply_llm_postprocess(&client, &local_endpoint("http://127.0.0.1:1/v1"), "整える", "そのまま", &opts()).await;
+        assert_eq!(out, "そのまま");
     }
 }

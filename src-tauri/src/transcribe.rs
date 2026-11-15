@@ -45,9 +45,9 @@ pub enum TranscribeError {
 
 #[derive(Debug, Clone)]
 pub struct TranscribeRequest {
-    /// 例: "https://api.groq.com/openai/v1/audio/transcriptions"
+    /// 例: "https://api.groq.com/openai/v1/audio/transcriptions" / "http://localhost:8080/v1/audio/transcriptions"
     pub api_url: String,
-    /// DPAPI 復号後の平文。ログに出さない。
+    /// DPAPI 復号後の平文。ログに出さない。空ならキーなし (Authorization を送らない・ローカルサーバー用)。
     pub api_key: String,
     /// 例: "whisper-large-v3-turbo" (Groq) / "gpt-4o-mini-transcribe" (OpenAI)
     pub model: String,
@@ -63,11 +63,9 @@ pub struct TranscribeRequest {
     pub file_name: String,
     /// 例: "audio/wav" / "audio/mpeg"
     pub mime_type: String,
-    /// Gateway PoC (2026-07-07 R-1): response_format=verbose_json + timestamp_granularities[]
-    /// を要求するか。従来は `api_url.contains("api.groq.com")` の URL 文字列判定で
-    /// 決めていたが、ゲートウェイ経由だと URL が api.groq.com を含まなくなり判定が壊れる
-    /// (halu 判定に必須の no_speech_prob/avg_logprob が消失する) ため、
-    /// 呼出元が明示的に指定するフィールドに置換した。
+    /// response_format=verbose_json + timestamp_granularities[] を要求するか。
+    /// URL 文字列ではなく接続先ごとに呼出元が決める (endpoints.rs)。
+    /// Groq は true (halu 判定に使う no_speech_prob/avg_logprob が取れる)。
     pub verbose_json: bool,
 }
 
@@ -147,10 +145,7 @@ pub async fn transcribe(
         form = form.text("timestamp_granularities[]", "segment");
     }
 
-    let request = client
-        .post(&req.api_url)
-        .bearer_auth(&req.api_key)
-        .multipart(form);
+    let request = crate::endpoints::with_auth(client.post(&req.api_url), &req.api_key).multipart(form);
 
     let start = std::time::Instant::now();
 
@@ -161,16 +156,6 @@ pub async fn transcribe(
     };
 
     let status = resp.status();
-    // ゲートウェイは残りが少ないトークンに延長用の新トークンを付けて返す (2026-11-11)。
-    // Groq/OpenAI へ直接送る経路では付かないので何もしない。
-    let refreshed_jwt = if status.is_success() {
-        resp.headers()
-            .get(crate::gateway_auth::REFRESH_TOKEN_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-    } else {
-        None
-    };
     let body = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(TranscribeError::Cancelled),
@@ -184,10 +169,6 @@ pub async fn transcribe(
             status: status.as_u16(),
             body,
         });
-    }
-
-    if let Some(jwt) = refreshed_jwt {
-        crate::gateway_auth::store_refreshed_jwt(&jwt);
     }
 
     debug!(
@@ -287,27 +268,6 @@ mod tests {
         assert!(s.contains("Invalid API key"), "got: {}", s);
     }
 
-    /// Gateway PoC (R-1 回帰防止): verbose_json は URL 文字列ではなくフィールドで決まる。
-    /// ゲートウェイ経由 (URL が api.groq.com を含まない) でも verbose_json: true なら
-    /// response_format=verbose_json になることを保証する代表テスト。
-    #[test]
-    fn verbose_json_field_controls_response_format_not_url() {
-        let mut req = dummy_request();
-        req.api_url = "https://rushvoice-gateway.example.workers.dev/groq/v1/audio/transcriptions"
-            .to_string();
-        req.verbose_json = true;
-        assert!(
-            req.verbose_json,
-            "gateway URL でも verbose_json フィールドが true なら維持されること"
-        );
-
-        req.verbose_json = false;
-        assert!(
-            !req.verbose_json,
-            "api.groq.com を含む URL でも verbose_json=false ならそのまま false"
-        );
-    }
-
     /// v0.1.16 機能 L Day 3: verbose_json が timestamp_granularities[] 追加分岐の前提として成立する。
     /// form ビルダ内部状態は直接検証できないため、フィールド判定の代表テストのみ
     /// (実 multipart 内容の検証は integration test で・Day 5 検討)。
@@ -315,11 +275,11 @@ mod tests {
     fn verbose_json_true_implies_timestamp_granularities_added() {
         // transcribe() 内の `if wants_verbose { form.text("timestamp_granularities[]", "segment") }`
         // の分岐条件そのものを直接検証 (URL には一切依存しない)。
-        let req_gateway = TranscribeRequest {
+        let req_verbose = TranscribeRequest {
             verbose_json: true,
             ..dummy_request()
         };
-        assert!(req_gateway.verbose_json, "verbose_json=true で分岐が有効になること");
+        assert!(req_verbose.verbose_json, "verbose_json=true で分岐が有効になること");
 
         let req_openai = TranscribeRequest {
             verbose_json: false,

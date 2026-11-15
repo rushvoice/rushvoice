@@ -118,10 +118,16 @@ pub struct SecretsFile {
     pub groq_api_key_encrypted: String,
     #[serde(rename = "openAiApiKeyEncrypted", default)]
     pub openai_api_key_encrypted: String,
-    /// Gateway ログイン (feature/gateway-login): メール+コードログインで得た JWT。
-    /// v1 スキーマには無い追加フィールド (serde default で後方互換)。
-    #[serde(rename = "gatewayJwtEncrypted", default)]
+    /// 旧版の RushVoice アカウント (ゲートウェイ) のログイン情報。2026-11-15 に終了。
+    /// 読むだけで書き出さない (次の保存で消える)。残っていたら移行の案内に使う。
+    #[serde(rename = "gatewayJwtEncrypted", default, skip_serializing)]
     pub gateway_jwt_encrypted: String,
+    /// 文字起こしのカスタム接続先 (OpenAI 互換) のキー。ローカルサーバーなら空でよい。
+    #[serde(rename = "customTranscribeApiKeyEncrypted", default)]
+    pub custom_transcribe_api_key_encrypted: String,
+    /// 整文・翻訳のカスタム接続先 (OpenAI 互換) のキー。ローカルサーバーなら空でよい。
+    #[serde(rename = "customLlmApiKeyEncrypted", default)]
+    pub custom_llm_api_key_encrypted: String,
 }
 
 /// 復号済み API キーバンドル。フィールド単位に Option を持ち、片方だけ復号失敗しても他方は使える。
@@ -129,30 +135,24 @@ pub struct SecretsFile {
 pub struct SecretsBundle {
     pub groq_api_key: Option<String>,
     pub openai_api_key: Option<String>,
-    /// Gateway ログイン JWT (feature/gateway-login)。ログに出さない。
-    pub gateway_jwt: Option<String>,
+    /// 文字起こしのカスタム接続先のキー (任意)。
+    pub custom_transcribe_api_key: Option<String>,
+    /// 整文・翻訳のカスタム接続先のキー (任意)。
+    pub custom_llm_api_key: Option<String>,
+    /// 旧版のゲートウェイのログイン情報がファイルに残っていたか (値は持たない)。
+    pub had_legacy_gateway_login: bool,
 }
 
 /// 平文 → DPAPI → Base64 → JSON。
-/// 入力は Option で、None のフィールドは空文字列として保存 (v1 と同じ振る舞い)。
-pub fn save_secrets(
-    path: &Path,
-    groq_api_key: Option<&str>,
-    openai_api_key: Option<&str>,
-    gateway_jwt: Option<&str>,
-) -> Result<(), CryptoError> {
-    let groq_enc = match groq_api_key {
-        Some(s) if !s.is_empty() => B64.encode(protect_bytes(s.as_bytes())?),
-        _ => String::new(),
-    };
-    let openai_enc = match openai_api_key {
-        Some(s) if !s.is_empty() => B64.encode(protect_bytes(s.as_bytes())?),
-        _ => String::new(),
-    };
-    let jwt_enc = match gateway_jwt {
-        Some(s) if !s.is_empty() => B64.encode(protect_bytes(s.as_bytes())?),
-        _ => String::new(),
-    };
+/// None・空文字のフィールドは空文字列として保存 (v1 と同じ振る舞い)。
+/// 旧版のゲートウェイのログイン情報は書き出さない (= 保存すると消える)。
+pub fn save_secrets(path: &Path, bundle: &SecretsBundle) -> Result<(), CryptoError> {
+    fn enc(v: &Option<String>) -> Result<String, CryptoError> {
+        Ok(match v.as_deref() {
+            Some(s) if !s.is_empty() => B64.encode(protect_bytes(s.as_bytes())?),
+            _ => String::new(),
+        })
+    }
 
     let machine = std::env::var("COMPUTERNAME").unwrap_or_default();
     let user = std::env::var("USERNAME").unwrap_or_default();
@@ -162,9 +162,11 @@ pub fn save_secrets(
         scope: "CurrentUser".to_string(),
         machine,
         user,
-        groq_api_key_encrypted: groq_enc,
-        openai_api_key_encrypted: openai_enc,
-        gateway_jwt_encrypted: jwt_enc,
+        groq_api_key_encrypted: enc(&bundle.groq_api_key)?,
+        openai_api_key_encrypted: enc(&bundle.openai_api_key)?,
+        gateway_jwt_encrypted: String::new(),
+        custom_transcribe_api_key_encrypted: enc(&bundle.custom_transcribe_api_key)?,
+        custom_llm_api_key_encrypted: enc(&bundle.custom_llm_api_key)?,
     };
 
     if let Some(parent) = path.parent() {
@@ -187,14 +189,12 @@ pub fn load_secrets(path: &Path) -> Result<Option<SecretsBundle>, CryptoError> {
     let raw = fs::read_to_string(path)?;
     let file: SecretsFile = serde_json::from_str(&raw)?;
 
-    let groq = decode_field(&file.groq_api_key_encrypted);
-    let openai = decode_field(&file.openai_api_key_encrypted);
-    let gateway_jwt = decode_field(&file.gateway_jwt_encrypted);
-
     Ok(Some(SecretsBundle {
-        groq_api_key: groq,
-        openai_api_key: openai,
-        gateway_jwt,
+        groq_api_key: decode_field(&file.groq_api_key_encrypted),
+        openai_api_key: decode_field(&file.openai_api_key_encrypted),
+        custom_transcribe_api_key: decode_field(&file.custom_transcribe_api_key_encrypted),
+        custom_llm_api_key: decode_field(&file.custom_llm_api_key_encrypted),
+        had_legacy_gateway_login: !file.gateway_jwt_encrypted.is_empty(),
     }))
 }
 
@@ -269,73 +269,68 @@ mod tests {
     }
 
     #[test]
-    fn save_load_roundtrip_both_keys() {
-        let dir = env::temp_dir().join("rushvoice_dpapi_test_both");
+    fn save_load_roundtrip_all_keys() {
+        let dir = env::temp_dir().join("rushvoice_dpapi_test_all");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("config.secrets.encrypted.json");
         let _ = fs::remove_file(&path);
 
-        save_secrets(
-            &path,
-            Some("gsk_dummy_groq_key"),
-            Some("sk-dummy_openai_key"),
-            None,
-        )
-        .expect("save");
-        let bundle = load_secrets(&path).expect("load").expect("Some");
-        assert_eq!(bundle.groq_api_key.as_deref(), Some("gsk_dummy_groq_key"));
-        assert_eq!(
-            bundle.openai_api_key.as_deref(),
-            Some("sk-dummy_openai_key")
+        let b = SecretsBundle {
+            groq_api_key: Some("dummy_groq_value".into()),
+            openai_api_key: Some("dummy_openai_value".into()),
+            custom_transcribe_api_key: Some("dummy_custom_asr".into()),
+            custom_llm_api_key: Some("dummy_custom_llm".into()),
+            had_legacy_gateway_login: false,
+        };
+        save_secrets(&path, &b).expect("save");
+        let loaded = load_secrets(&path).expect("load").expect("Some");
+        assert_eq!(loaded, b);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 旧版のゲートウェイのログイン情報が残ったファイル: 読めて、印が立ち、保存し直すと消える。
+    #[test]
+    fn legacy_gateway_login_is_detected_and_dropped_on_save() {
+        let dir = env::temp_dir().join("rushvoice_dpapi_test_legacy_gateway");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.secrets.encrypted.json");
+        let groq_enc = B64.encode(protect_bytes(b"dummy_groq").expect("protect"));
+        let jwt_enc = B64.encode(protect_bytes(b"dummy.jwt.value").expect("protect"));
+        let json = format!(
+            r#"{{"encryptedAt":"2026-01-01T00:00:00Z","scope":"CurrentUser","machine":"m","user":"u","groqApiKeyEncrypted":"{}","openAiApiKeyEncrypted":"","gatewayJwtEncrypted":"{}"}}"#,
+            groq_enc, jwt_enc
         );
-        assert_eq!(bundle.gateway_jwt, None);
+        fs::write(&path, json).expect("write");
+        let loaded = load_secrets(&path).expect("load").expect("Some");
+        assert!(loaded.had_legacy_gateway_login);
+        assert_eq!(loaded.groq_api_key.as_deref(), Some("dummy_groq"));
 
+        save_secrets(&path, &loaded).expect("save");
+        let raw = fs::read_to_string(&path).expect("read");
+        assert!(!raw.contains("gatewayJwtEncrypted"), "保存し直したら旧ログイン情報は書かれない");
+        let again = load_secrets(&path).expect("load 2").expect("Some");
+        assert!(!again.had_legacy_gateway_login);
+        assert_eq!(again.groq_api_key.as_deref(), Some("dummy_groq"));
         let _ = fs::remove_file(&path);
     }
 
-    /// Gateway ログイン: JWT roundtrip + 削除 (None 上書き) を確認。
+    /// 後方互換: 追加フィールドが無い v1 の JSON も読める (serde default)。
     #[test]
-    fn save_load_roundtrip_gateway_jwt() {
-        let dir = env::temp_dir().join("rushvoice_dpapi_test_gateway_jwt");
-        let _ = fs::create_dir_all(&dir);
-        let path = dir.join("config.secrets.encrypted.json");
-        let _ = fs::remove_file(&path);
-
-        save_secrets(&path, Some("gsk_dummy"), None, Some("dummy.jwt.value")).expect("save");
-        let bundle = load_secrets(&path).expect("load").expect("Some");
-        assert_eq!(bundle.gateway_jwt.as_deref(), Some("dummy.jwt.value"));
-        assert_eq!(bundle.groq_api_key.as_deref(), Some("gsk_dummy"));
-
-        // ログアウト相当 (jwt=None) で JWT のみ消え、他キーは維持される
-        save_secrets(
-            &path,
-            bundle.groq_api_key.as_deref(),
-            bundle.openai_api_key.as_deref(),
-            None,
-        )
-        .expect("save 2");
-        let bundle2 = load_secrets(&path).expect("load 2").expect("Some");
-        assert_eq!(bundle2.gateway_jwt, None);
-        assert_eq!(bundle2.groq_api_key.as_deref(), Some("gsk_dummy"));
-
-        let _ = fs::remove_file(&path);
-    }
-
-    /// 後方互換: gatewayJwtEncrypted フィールドが無い既存 JSON も読める (serde default)。
-    #[test]
-    fn load_legacy_json_without_gateway_field() {
+    fn load_legacy_v1_json() {
         let dir = env::temp_dir().join("rushvoice_dpapi_test_legacy");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("config.secrets.encrypted.json");
-        let groq_enc = B64.encode(protect_bytes(b"gsk_legacy").expect("protect"));
+        let groq_enc = B64.encode(protect_bytes(b"dummy_legacy").expect("protect"));
         let json = format!(
             r#"{{"encryptedAt":"2026-01-01T00:00:00Z","scope":"CurrentUser","machine":"m","user":"u","groqApiKeyEncrypted":"{}","openAiApiKeyEncrypted":""}}"#,
             groq_enc
         );
         fs::write(&path, json).expect("write");
-        let bundle = load_secrets(&path).expect("load").expect("Some");
-        assert_eq!(bundle.groq_api_key.as_deref(), Some("gsk_legacy"));
-        assert_eq!(bundle.gateway_jwt, None);
+        let loaded = load_secrets(&path).expect("load").expect("Some");
+        assert_eq!(loaded.groq_api_key.as_deref(), Some("dummy_legacy"));
+        assert!(!loaded.had_legacy_gateway_login);
+        assert_eq!(loaded.custom_llm_api_key, None);
         let _ = fs::remove_file(&path);
     }
 
@@ -346,7 +341,11 @@ mod tests {
         let path = dir.join("config.secrets.encrypted.json");
         let _ = fs::remove_file(&path);
 
-        save_secrets(&path, Some("gsk_only_groq"), None, None).expect("save");
+        let only_groq = SecretsBundle {
+            groq_api_key: Some("gsk_only_groq".into()),
+            ..Default::default()
+        };
+        save_secrets(&path, &only_groq).expect("save");
         let bundle = load_secrets(&path).expect("load").expect("Some");
         assert_eq!(bundle.groq_api_key.as_deref(), Some("gsk_only_groq"));
         assert_eq!(bundle.openai_api_key, None);

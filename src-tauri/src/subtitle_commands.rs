@@ -17,16 +17,14 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use crate::meeting_commands::load_groq_api_key;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tokio_util::sync::CancellationToken;
 
 /// 翻訳 LLM モデル (llm_postprocess.rs と同じ既存採用モデルを流用)。
-const TRANSLATE_MODEL: &str = "llama-3.3-70b-versatile";
-// 宛先 URL は llm_postprocess::resolve_chat_completions_endpoint が返す
-// (gateway ログイン時は gateway 経由・未ログイン時は Groq 直行)。
+// 宛先・キー・モデルは endpoints.rs が決める (文字起こし = verbose_json 必須の接続先・
+// 翻訳 = 整文と同じ接続先)。
 /// 転写リトライ (字幕は低遅延優先: 初回 + 1 リトライのみ・バックオフ 500ms)。
 const SUBTITLE_TRANSCRIBE_RETRIES: u32 = 1;
 
@@ -89,12 +87,21 @@ pub async fn subtitle_start(
 
     log::info!("[subtitle][dbg] guards passed");
 
-    // API キー (議事録と同じ取得経路)
-    let api_key = match load_groq_api_key() {
-        Ok(k) => k,
-        Err(e) => return Err(e),
+    // 接続先 (議事録と同じ: 言語判定に verbose_json が要る)
+    let transcribe_ep = crate::endpoints::load_segment_transcribe_endpoint()?;
+    // 翻訳の接続先。未設定なら翻訳せず原文のまま出す (decide_rows のフォールバック)
+    let chat_ep = match crate::endpoints::load_chat_endpoint() {
+        Ok(ep) => Some(ep),
+        Err(e) => {
+            log::warn!("[subtitle] translation disabled: {}", e);
+            None
+        }
     };
-    log::info!("[subtitle][dbg] api key loaded");
+    log::info!(
+        "[subtitle][dbg] endpoints: transcribe={} chat={:?}",
+        transcribe_ep.label,
+        chat_ep.as_ref().map(|c| c.label)
+    );
 
     // 辞書 replacement → 翻訳プロンプトに固有名詞ヒント注入 (L209 対応)
     // 新しい登録を先頭に (reverse): 上限切り捨て (翻訳30語/400字・Whisper180字) を
@@ -190,7 +197,8 @@ pub async fn subtitle_start(
         run_subtitle_pipeline(
             app_bg,
             rx,
-            api_key,
+            transcribe_ep,
+            chat_ep,
             system_prompt,
             whisper_prompt_ja,
             target_lang,
@@ -307,7 +315,7 @@ async fn transcribe_utterance(
     client: &reqwest::Client,
     wav_path: &PathBuf,
     idx: usize,
-    api_key: &str,
+    endpoint: &crate::endpoints::TranscribeEndpoint,
     prompt: &str,
 ) -> Result<String, String> {
     let audio = tokio::fs::read(wav_path)
@@ -316,9 +324,9 @@ async fn transcribe_utterance(
     let mut last_err = String::new();
     for attempt in 0..=SUBTITLE_TRANSCRIBE_RETRIES {
         let req = crate::transcribe::TranscribeRequest {
-            api_url: crate::recorder::GROQ_TRANSCRIBE_URL.to_string(),
-            api_key: api_key.to_string(),
-            model: crate::recorder::GROQ_MODEL.to_string(),
+            api_url: endpoint.url.clone(),
+            api_key: endpoint.api_key.clone(),
+            model: endpoint.model.clone(),
             // 適応方式: 直前発話が日本語のときのみ辞書入り prompt (呼出側で決定)。
             // 常時付与しないのは Whisper の言語自動判定が日本語に偏るのを防ぐため。
             prompt: prompt.to_string(),
@@ -327,7 +335,7 @@ async fn transcribe_utterance(
             audio: audio.clone(),
             file_name: format!("utterance_{:03}.wav", idx),
             mime_type: "audio/wav".to_string(),
-            // Gateway PoC (SSOT §4-B(3)): 字幕は現行も verbose_json 前提 (言語検出に使用)。URL は変更しない。
+            // 字幕は verbose_json 前提 (トップレベル "language" で言語検出)
             verbose_json: true,
         };
         match crate::transcribe::transcribe(client, req, CancellationToken::new()).await {
@@ -343,22 +351,18 @@ async fn transcribe_utterance(
     Err(format!("utterance {} transcribe failed: {}", idx, last_err))
 }
 
-/// Groq Chat Completions で翻訳 JSON を取得する。失敗時 None (呼出側で原文フォールバック)。
+/// Chat Completions (整文と同じ接続先) で翻訳 JSON を取得する。失敗時 None (呼出側で原文フォールバック)。
 ///
 /// llm_postprocess::apply_llm_postprocess は日本語強制サフィックスを付与するため流用不可。
 /// 字幕翻訳専用に response_format=json_object で JSON のみ返させる。
 async fn translate_chat(
     client: &reqwest::Client,
-    api_key: &str,
+    endpoint: Option<&crate::endpoints::ChatEndpoint>,
     system_prompt: &str,
     context: &str,
     text: &str,
-    gateway: Option<&crate::recorder::GatewayRoute>,
 ) -> Option<String> {
-    // 2026-07-27: 字幕翻訳も Groq 直叩きのままだったため gateway 経由に対応させる
-    // (後処理と同じ解決器を使う。gateway 側は /groq/ の汎用プロキシ)。
-    let (endpoint_url, auth_token) =
-        crate::llm_postprocess::resolve_chat_completions_endpoint(gateway, api_key);
+    let endpoint = endpoint?;
     // 直前発話を語義判定用の文脈として添える (文が途中分断された場合の誤訳/誤補正防止)。
     // 文脈自体は訳させない (出力 JSON に含めない指示)。
     let user_content = if context.is_empty() {
@@ -371,8 +375,8 @@ async fn translate_chat(
             context, text
         )
     };
-    let req = serde_json::json!({
-        "model": TRANSLATE_MODEL,
+    let mut req = serde_json::json!({
+        "model": endpoint.model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
@@ -381,22 +385,34 @@ async fn translate_chat(
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
     });
-    let resp = match client
-        .post(&endpoint_url)
-        .header("Authorization", format!("Bearer {}", auth_token))
-        .header("Content-Type", "application/json")
-        .json(&req)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            log::warn!("[subtitle] translate request failed: {}", e);
-            return None;
+    // JSON モード (response_format) を受け付けないローカルサーバーがあるため、
+    // 400 のときだけ外して 1 回だけ送り直す (プロンプト側でも JSON だけ返すよう指示済み)。
+    let mut attempt = 0;
+    let resp = loop {
+        attempt += 1;
+        let resp = match crate::endpoints::with_auth(client.post(&endpoint.url), &endpoint.api_key)
+            .header("Content-Type", "application/json")
+            .json(&req)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("[subtitle] translate request failed: {}", e);
+                return None;
+            }
+        };
+        if resp.status().as_u16() == 400 && attempt == 1 {
+            log::info!("[subtitle] translate HTTP 400 from {}; retrying without response_format", endpoint.label);
+            if let Some(obj) = req.as_object_mut() {
+                obj.remove("response_format");
+            }
+            continue;
         }
+        break resp;
     };
     if !resp.status().is_success() {
-        log::warn!("[subtitle] translate HTTP {}", resp.status());
+        log::warn!("[subtitle] translate HTTP {} from {}", resp.status(), endpoint.label);
         return None;
     }
     let body = resp.text().await.ok()?;
@@ -420,7 +436,8 @@ async fn translate_chat(
 async fn run_subtitle_pipeline(
     app: AppHandle,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<(usize, PathBuf)>,
-    api_key: String,
+    transcribe_ep: crate::endpoints::TranscribeEndpoint,
+    chat_ep: Option<crate::endpoints::ChatEndpoint>,
     system_prompt: String,
     whisper_prompt_ja: String,
     target_lang: String,
@@ -458,7 +475,7 @@ async fn run_subtitle_pipeline(
         let whisper_prompt = whisper_prompt.as_str();
 
         // 1. 転写 (language 自動判定)
-        let body = match transcribe_utterance(&client, &wav_path, idx, &api_key, whisper_prompt).await {
+        let body = match transcribe_utterance(&client, &wav_path, idx, &transcribe_ep, whisper_prompt).await {
             Ok(b) => b,
             Err(e) => {
                 log::error!("[subtitle] {} (skip)", e);
@@ -521,12 +538,10 @@ async fn run_subtitle_pipeline(
         // 2. 翻訳 (失敗は decide_rows の原文フォールバックに委ねる)
         let translated = translate_chat(
             &client,
-            &api_key,
+            chat_ep.as_ref(),
             &system_prompt,
             &context_for_llm,
             &text,
-            // gateway ログイン中は字幕翻訳も gateway 経由 (未ログインなら従来の BYOK)
-            crate::load_gateway_route_opt().as_ref(),
         )
         .await
             .and_then(|raw| crate::subtitle::parse_translation_json(&raw));
