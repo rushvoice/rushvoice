@@ -30,7 +30,7 @@ import { cn } from '../lib/cn'
 import { CongestionBanner } from '../components/CongestionBanner'
 import { MicLowLevelBanner } from '../components/MicLowLevelBanner'
 import { QuietVoiceBanner } from '../components/QuietVoiceBanner'
-import { GatewayEntitlementBanner } from '../components/GatewayEntitlementBanner'
+import { GatewayRetiredNotice } from '../components/GatewayRetiredNotice'
 
 // 設定 hotkey を「右Ctrl + 右Shift + 無変換」のような日本語表記に
 const MOD_ORDER = [
@@ -86,7 +86,7 @@ function sortProfiles(profiles: Profile[]): Profile[] {
   })
 }
 
-export function HomePage() {
+export function HomePage({ onOpenSettings }: { onOpenSettings?: () => void } = {}) {
   const [state, setState] = useState<RecorderState>('idle')
   // 要望 (2026-05-21): 最新文字起こしを Home でも確認できるよう復活
   // (Overlay は 3 秒で消えるため、全文を後から見たい時のための表示)
@@ -315,8 +315,8 @@ export function HomePage() {
           {/* v0.1.15: 小声警告 (文字起こし完了後に表示・自動消去) */}
           <QuietVoiceBanner />
         </div>
-        {/* Gateway ログイン (A-2-4): 403/429 インラインバナー (L337: alert 禁止) */}
-        <GatewayEntitlementBanner />
+        {/* 2026-11-15: 旧版の有料アカウント終了の案内 (旧版でログインしていた人にだけ出る) */}
+        <GatewayRetiredNotice onOpenSettings={onOpenSettings} />
       </div>
 
       <div className="mt-2 text-center max-w-md">

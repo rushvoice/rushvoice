@@ -142,10 +142,11 @@ pub fn migrate_v1_to_v2(
     if has_groq || has_openai {
         save_secrets(
             v2_secrets_path,
-            v1.groq_api_key.as_deref().filter(|s| !s.is_empty()),
-            v1.openai_api_key.as_deref().filter(|s| !s.is_empty()),
-            // v1 に gateway JWT は存在しない (feature/gateway-login で追加)
-            None,
+            &crate::crypto::SecretsBundle {
+                groq_api_key: v1.groq_api_key.clone().filter(|s| !s.is_empty()),
+                openai_api_key: v1.openai_api_key.clone().filter(|s| !s.is_empty()),
+                ..Default::default()
+            },
         )?;
         // Codex P1 #3: 暗号化成功後に v1 config の平文 API キーフィールドを空欄化する
         // (精読ノート §3.6 / Encrypt-ApiKey.ps1 L100-121 と同じ動作)

@@ -52,8 +52,12 @@ const SERVICE: &str = "com.olive.rushvoice";
 /// 同じ service 配下に複数アカウントを並べて区別する。
 const ACCOUNT_GROQ: &str = "groq_api_key";
 const ACCOUNT_OPENAI: &str = "openai_api_key";
-/// Gateway ログイン (feature/gateway-login): メール+コードログインで得た JWT。
+/// 旧版の RushVoice アカウント (ゲートウェイ) のログイン情報。2026-11-15 に終了。
+/// 読むのは「残っていたか」の判定だけ。保存のたびに消す。
 const ACCOUNT_GATEWAY_JWT: &str = "gateway_jwt";
+/// カスタム接続先 (OpenAI 互換) のキー。ローカルサーバーなら無くてよい。
+const ACCOUNT_CUSTOM_TRANSCRIBE: &str = "custom_transcribe_api_key";
+const ACCOUNT_CUSTOM_LLM: &str = "custom_llm_api_key";
 
 /// SecretsFile.encrypted フィールドに置くプレースホルダ。
 /// 実 API キーは Keychain にあるため、ファイル側には保存しない。
@@ -89,9 +93,13 @@ pub struct SecretsFile {
     pub groq_api_key_encrypted: String,
     #[serde(rename = "openAiApiKeyEncrypted", default)]
     pub openai_api_key_encrypted: String,
-    /// Gateway ログイン JWT (feature/gateway-login・serde default で後方互換)。
-    #[serde(rename = "gatewayJwtEncrypted", default)]
+    /// 旧版のゲートウェイのログイン情報 (読むだけ・書き出さない)。
+    #[serde(rename = "gatewayJwtEncrypted", default, skip_serializing)]
     pub gateway_jwt_encrypted: String,
+    #[serde(rename = "customTranscribeApiKeyEncrypted", default)]
+    pub custom_transcribe_api_key_encrypted: String,
+    #[serde(rename = "customLlmApiKeyEncrypted", default)]
+    pub custom_llm_api_key_encrypted: String,
 }
 
 /// 復号済み API キーバンドル (Windows 実装と同一定義)。
@@ -99,8 +107,12 @@ pub struct SecretsFile {
 pub struct SecretsBundle {
     pub groq_api_key: Option<String>,
     pub openai_api_key: Option<String>,
-    /// Gateway ログイン JWT (feature/gateway-login)。ログに出さない。
-    pub gateway_jwt: Option<String>,
+    /// 文字起こしのカスタム接続先のキー (任意)。
+    pub custom_transcribe_api_key: Option<String>,
+    /// 整文・翻訳のカスタム接続先のキー (任意)。
+    pub custom_llm_api_key: Option<String>,
+    /// 旧版のゲートウェイのログイン情報が Keychain に残っていたか (値は持たない)。
+    pub had_legacy_gateway_login: bool,
 }
 
 /// macOS では Keychain が key-value 抽象であり、任意バイト列を端末固有鍵で
@@ -127,15 +139,17 @@ pub fn unprotect_bytes(_enc: &[u8]) -> Result<Vec<u8>, CryptoError> {
 ///   - 既存無しのとき errSecItemNotFound が返るのでそれは無視
 /// - SecretsFile はメタデータ (timestamp + machine + user) としてファイルに残す
 ///   - encrypted フィールドには KEYCHAIN_PLACEHOLDER を入れる (Windows 版 BLOB と同じ位置)
-pub fn save_secrets(
-    path: &Path,
-    groq_api_key: Option<&str>,
-    openai_api_key: Option<&str>,
-    gateway_jwt: Option<&str>,
-) -> Result<(), CryptoError> {
+pub fn save_secrets(path: &Path, bundle: &SecretsBundle) -> Result<(), CryptoError> {
+    let groq_api_key = bundle.groq_api_key.as_deref();
+    let openai_api_key = bundle.openai_api_key.as_deref();
+    let custom_transcribe = bundle.custom_transcribe_api_key.as_deref();
+    let custom_llm = bundle.custom_llm_api_key.as_deref();
     write_or_delete(ACCOUNT_GROQ, groq_api_key)?;
     write_or_delete(ACCOUNT_OPENAI, openai_api_key)?;
-    write_or_delete(ACCOUNT_GATEWAY_JWT, gateway_jwt)?;
+    write_or_delete(ACCOUNT_CUSTOM_TRANSCRIBE, custom_transcribe)?;
+    write_or_delete(ACCOUNT_CUSTOM_LLM, custom_llm)?;
+    // 旧版のゲートウェイのログイン情報は保存のたびに消す
+    write_or_delete(ACCOUNT_GATEWAY_JWT, None)?;
 
     let machine = hostname_macos();
     let user = std::env::var("USER").unwrap_or_default();
@@ -148,7 +162,9 @@ pub fn save_secrets(
         user,
         groq_api_key_encrypted: presence_marker(groq_api_key),
         openai_api_key_encrypted: presence_marker(openai_api_key),
-        gateway_jwt_encrypted: presence_marker(gateway_jwt),
+        gateway_jwt_encrypted: String::new(),
+        custom_transcribe_api_key_encrypted: presence_marker(custom_transcribe),
+        custom_llm_api_key_encrypted: presence_marker(custom_llm),
     };
 
     if let Some(parent) = path.parent() {
@@ -169,20 +185,19 @@ pub fn save_secrets(
 /// - ファイル自体が無く Keychain にも何も無い場合は Ok(None) を返す
 ///   (Windows 版「ファイル無し→Ok(None)」と同じ起動可能性を保証)
 pub fn load_secrets(_path: &Path) -> Result<Option<SecretsBundle>, CryptoError> {
-    let groq = load_account(ACCOUNT_GROQ);
-    let openai = load_account(ACCOUNT_OPENAI);
-    let gateway_jwt = load_account(ACCOUNT_GATEWAY_JWT);
+    let bundle = SecretsBundle {
+        groq_api_key: load_account(ACCOUNT_GROQ),
+        openai_api_key: load_account(ACCOUNT_OPENAI),
+        custom_transcribe_api_key: load_account(ACCOUNT_CUSTOM_TRANSCRIBE),
+        custom_llm_api_key: load_account(ACCOUNT_CUSTOM_LLM),
+        had_legacy_gateway_login: load_account(ACCOUNT_GATEWAY_JWT).is_some(),
+    };
 
-    // 全部 None なら従来通り「未設定扱い」(env var フォールバック)
-    if groq.is_none() && openai.is_none() && gateway_jwt.is_none() {
+    // 全部無いなら従来通り「未設定扱い」
+    if bundle == SecretsBundle::default() {
         return Ok(None);
     }
-
-    Ok(Some(SecretsBundle {
-        groq_api_key: groq,
-        openai_api_key: openai,
-        gateway_jwt,
-    }))
+    Ok(Some(bundle))
 }
 
 /// macOS 標準の secrets メタデータ保存先パス。
@@ -244,4 +259,49 @@ fn hostname_macos() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_default()
+}
+
+// 実際のログインキーチェーンを書き換えるため、通常の `cargo test` では動かさない (#[ignore])。
+// CI (test-macos-keychain.yml) で使い捨てのキーチェーンを既定にしてから `--ignored` で動かす。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rushvoice-keychain-test-{}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    #[ignore]
+    fn keychain_round_trip_and_gateway_removal() {
+        let path = tmp_path();
+        // 旧版のログイン情報が残っている状態を作る
+        set_generic_password(SERVICE, ACCOUNT_GATEWAY_JWT, b"legacy").unwrap();
+        let before = load_secrets(&path).unwrap().unwrap();
+        assert!(before.had_legacy_gateway_login);
+
+        let bundle = SecretsBundle {
+            groq_api_key: Some("test-groq".into()),
+            openai_api_key: None,
+            custom_transcribe_api_key: None,
+            custom_llm_api_key: Some("test-custom-llm".into()),
+            had_legacy_gateway_login: false,
+        };
+        save_secrets(&path, &bundle).unwrap();
+
+        let loaded = load_secrets(&path).unwrap().unwrap();
+        assert_eq!(loaded, bundle, "保存した値が読める・旧ログイン情報は消える");
+
+        let meta = fs::read_to_string(&path).unwrap();
+        assert!(!meta.contains("test-groq"), "メタデータに値を書かない");
+        assert!(!meta.contains("gatewayJwtEncrypted"));
+
+        // 空で保存すると消え、未設定扱いに戻る
+        save_secrets(&path, &SecretsBundle::default()).unwrap();
+        assert_eq!(load_secrets(&path).unwrap(), None);
+        let _ = fs::remove_file(&path);
+    }
 }

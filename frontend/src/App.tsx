@@ -13,8 +13,6 @@ import { SettingsPage } from './pages/SettingsPage'
 import { MeetingTabsPage } from './pages/MeetingTabsPage'
 // feature/seminar-subtitle: セミナー字幕モード
 import { SeminarSubtitlePage } from './pages/SeminarSubtitlePage'
-// 2026-07-28: プラン別ゲート (プロ限定機能)
-import { ProFeatureGate } from './components/ProFeatureGate'
 import type { MeetingStateEvent } from './types/meeting'
 
 function App() {
@@ -47,30 +45,16 @@ function App() {
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-neutral-900 text-white antialiased">
       <Sidebar current={page} onChange={setPage} />
-      {page === 'home' && <HomePage />}
+      {page === 'home' && <HomePage onOpenSettings={() => setPage('settings')} />}
       {page === 'history' && <HistoryPage />}
       {page === 'dictionary' && <DictionaryPage />}
       {page === 'apps' && <AppsPage />}
       {page === 'profile' && <ProfilePage />}
       {page === 'settings' && <SettingsPage />}
-      {/* v0.1.16 機能 L Day 4 → 2026-07-23 タブ統合: 議事録 (記録/履歴サブタブ)
-          2026-07-28: プロプラン限定機能としてゲート (trial / 未ログインは従来どおり通す) */}
-      {page === 'meeting' && (
-        <ProFeatureGate
-          featureName="議事録モード"
-          description="長時間の会議を録音し、話し言葉を整理した議事録として書き出す機能です。"
-        >
-          <MeetingTabsPage />
-        </ProFeatureGate>
-      )}
-      {page === 'subtitle' && (
-        <ProFeatureGate
-          featureName="セミナー字幕"
-          description="話した内容をその場で翻訳し、2 段字幕として表示する機能です。"
-        >
-          <SeminarSubtitlePage />
-        </ProFeatureGate>
-      )}
+      {/* v0.1.16 機能 L Day 4 → 2026-07-23 タブ統合: 議事録 (記録/履歴サブタブ)。
+          2026-11-15: 有料版の終了に伴いプラン別ゲートを外した (全機能を誰でも使える) */}
+      {page === 'meeting' && <MeetingTabsPage />}
+      {page === 'subtitle' && <SeminarSubtitlePage />}
       {/* v0.1.10 機能 D: 起動時ホットキー競合ダイアログ (event listen ベース) */}
       <HotkeyConflictDialog onJumpToSettings={() => setPage('settings')} />
       <Toaster theme="dark" position="bottom-right" />

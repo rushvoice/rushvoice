@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
-import { AlertTriangle, Lock, Save, Zap, Upload, Download, Trash2, Check, Keyboard, Pencil, Power, Database, Eye, EyeOff, Mic, LogOut, Mail, UserRound, Loader2, ExternalLink } from 'lucide-react'
+import { AlertTriangle, Lock, Save, Zap, Upload, Download, Trash2, Check, Keyboard, Pencil, Power, Database, Eye, EyeOff, Mic } from 'lucide-react'
 import * as Checkbox from '@radix-ui/react-checkbox'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { toast } from 'sonner'
@@ -15,6 +15,13 @@ import {
   deleteApiKey,
   testApiKey,
   testStoredApiKey,
+  testEndpointUrl,
+  TRANSCRIBE_PROVIDER_KEY,
+  CUSTOM_TRANSCRIBE_BASE_URL_KEY,
+  CUSTOM_TRANSCRIBE_MODEL_KEY,
+  LLM_PROVIDER_KEY,
+  CUSTOM_LLM_BASE_URL_KEY,
+  CUSTOM_LLM_MODEL_KEY,
   getHotkeyConfig,
   setHotkeyConfig,
   getHotkeyConflictState,
@@ -25,138 +32,28 @@ import {
   clearHistory,
   getCongestionConfig,
   setCongestionConfig,
-  gatewayRequestCode,
-  gatewayVerifyCode,
-  gatewayStatus,
-  gatewayLogout,
-  gatewayOpenCheckout,
-  PLAN_CATALOG,
-  type PurchasablePlan,
   type Provider,
   type HotkeyConfig,
   type HotkeyMode,
   type CongestionConfig,
-  type GatewayStatus,
 } from '../lib/tauri'
+import { GatewayRetiredNotice } from '../components/GatewayRetiredNotice'
 import { cn } from '../lib/cn'
 
-type SaveState = 'idle' | 'saving' | 'testing'
-
-const PROVIDER_KEY = 'provider'
-const DEFAULT_PROVIDER = 'hedged'
-
 export function SettingsPage() {
-  const [groqInput, setGroqInput] = useState('')
-  const [openaiInput, setOpenaiInput] = useState('')
-  const [groqStored, setGroqStored] = useState(false)
-  const [openaiStored, setOpenaiStored] = useState(false)
-  const [provider, setProvider] = useState<string>(DEFAULT_PROVIDER)
-  const [saveState, setSaveState] = useState<SaveState>('idle')
-  const [loaded, setLoaded] = useState(false)
-
-  // 起動時 load
-  useEffect(() => {
-    (async () => {
-      try {
-        const [g, o, p] = await Promise.all([
-          hasApiKey('groq'),
-          hasApiKey('openai'),
-          getSetting(PROVIDER_KEY),
-        ])
-        setGroqStored(g)
-        setOpenaiStored(o)
-        if (p) setProvider(p)
-      } catch (e) {
-        toast.error(`設定読み込み失敗: ${e}`)
-      } finally {
-        setLoaded(true)
-      }
-    })()
-  }, [])
-
-  async function handleSaveApiKey(p: Provider, value: string) {
-    if (!value.trim()) {
-      toast.error('API キーが空です')
-      return
-    }
-    setSaveState('saving')
-    try {
-      await saveApiKey(p, value.trim())
-      toast.success(`${p === 'groq' ? 'Groq' : 'OpenAI'} API キーを暗号化保存しました`)
-      if (p === 'groq') {
-        setGroqInput('')
-        setGroqStored(true)
-      } else {
-        setOpenaiInput('')
-        setOpenaiStored(true)
-      }
-    } catch (e) {
-      toast.error(`保存失敗: ${e}`)
-    } finally {
-      setSaveState('idle')
-    }
-  }
-
-  async function handleDeleteApiKey(p: Provider) {
-    if (!confirm(`${p === 'groq' ? 'Groq' : 'OpenAI'} API キーを削除しますか？`)) return
-    setSaveState('saving')
-    try {
-      await deleteApiKey(p)
-      toast.success(`${p === 'groq' ? 'Groq' : 'OpenAI'} API キーを削除しました`)
-      if (p === 'groq') setGroqStored(false)
-      else setOpenaiStored(false)
-    } catch (e) {
-      toast.error(`削除失敗: ${e}`)
-    } finally {
-      setSaveState('idle')
-    }
-  }
-
-  async function handleTestApiKey(p: Provider, value: string, stored: boolean) {
-    const trimmed = value.trim()
-    if (!trimmed && !stored) {
-      toast.error('テストする API キーを入力してください')
-      return
-    }
-    setSaveState('testing')
-    try {
-      const r = trimmed
-        ? await testApiKey(p, trimmed)
-        : await testStoredApiKey(p)
-      if (r.ok) {
-        toast.success(`接続成功 (HTTP ${r.status})`)
-      } else {
-        toast.error(`接続失敗: ${r.message}`)
-      }
-    } catch (e) {
-      toast.error(`テスト失敗: ${e}`)
-    } finally {
-      setSaveState('idle')
-    }
-  }
-
-  async function handleProviderChange(newProvider: string) {
-    setProvider(newProvider)
-    try {
-      await setSetting(PROVIDER_KEY, newProvider)
-      toast.success('プロバイダー設定を保存しました')
-    } catch (e) {
-      toast.error(`プロバイダー保存失敗: ${e}`)
-    }
-  }
-
-  const busy = saveState !== 'idle' || !loaded
-
   return (
     <div className="flex-1 bg-neutral-900 text-white p-8 overflow-y-auto">
       <header className="mb-6">
         <h2 className="text-xl font-semibold">設定</h2>
         <p className="text-sm text-neutral-500 mt-1">
-          ホットキー・認識設定・API キー
+          ホットキー・認識設定・接続先と API キー
         </p>
       </header>
 
       <section className="space-y-6 max-w-2xl">
+        {/* 2026-11-15: 旧版の有料アカウント終了の案内 (旧版でログインしていた人にだけ出る) */}
+        <GatewayRetiredNotice />
+
         {/* ホットキー (頻繁に変更するため最上位・要望 2026-05-21) */}
         <HotkeySection />
 
@@ -179,67 +76,17 @@ export function SettingsPage() {
               <option>日本語 (ja) - 固定</option>
             </select>
           </div>
-
-          <div>
-            <label className="block text-xs text-neutral-400 mb-1.5">
-              プロバイダー
-            </label>
-            <select
-              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-md text-sm disabled:opacity-60"
-              value={provider}
-              onChange={(e) => handleProviderChange(e.target.value)}
-              disabled={busy}
-            >
-              <option value="hedged">Groq + OpenAI hedged (trigger=3.0s) — v0.1.9 active</option>
-              <option value="groq">Groq 単独</option>
-              <option value="openai">OpenAI 単独</option>
-            </select>
-          </div>
         </div>
 
         {/* マイク選択 (2026-07-23 要望: Shokz併用時にGUIで即切替) */}
         <MicSection />
 
-        {/* v0.1.10 機能 A: 通知バナー (Groq 混雑時の安心バナー閾値) */}
+        {/* v0.1.10 機能 A: 通知バナー (混雑時の安心バナー閾値) */}
         <CongestionSection />
 
-        {/* Gateway ログイン (feature/gateway-login): RushVoice アカウント */}
-        <AccountSection />
-
-        {/* API キー (一度設定したら触らないので下に・要望 2026-05-21) */}
-        <div className="space-y-4 p-5 bg-neutral-950 border border-neutral-800 rounded-lg">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-medium text-neutral-200">API キー</h3>
-            <div className="flex items-center gap-1.5 text-xs text-emerald-400/80">
-              <Lock size={12} />
-              <span>DPAPI 暗号化</span>
-            </div>
-          </div>
-
-          <ApiKeyRow
-            label="Groq API キー"
-            placeholder={groqStored ? '●●●●●●●●●●●● (保存済み)' : 'gsk_...'}
-            value={groqInput}
-            onChange={setGroqInput}
-            stored={groqStored}
-            busy={busy}
-            onSave={() => handleSaveApiKey('groq', groqInput)}
-            onTest={() => handleTestApiKey('groq', groqInput, groqStored)}
-            onDelete={() => handleDeleteApiKey('groq')}
-          />
-
-          <ApiKeyRow
-            label="OpenAI API キー"
-            placeholder={openaiStored ? '●●●●●●●●●●●● (保存済み)' : 'sk-...'}
-            value={openaiInput}
-            onChange={setOpenaiInput}
-            stored={openaiStored}
-            busy={busy}
-            onSave={() => handleSaveApiKey('openai', openaiInput)}
-            onTest={() => handleTestApiKey('openai', openaiInput, openaiStored)}
-            onDelete={() => handleDeleteApiKey('openai')}
-          />
-        </div>
+        {/* 接続先と API キー (一度設定したら触らないので下に・要望 2026-05-21)
+            2026-11-15: 有料版のログインを廃止し、自分のキー・OpenAI 互換の任意の接続先 (ローカル LLM 可) にした */}
+        <EndpointSection />
 
         {/* 辞書 (Stage 2 以降) */}
         <div className="space-y-3 p-5 bg-neutral-950 border border-neutral-800 rounded-lg">
@@ -291,6 +138,8 @@ interface ApiKeyRowProps {
   onSave: () => void
   onTest: () => void
   onDelete: () => void
+  /** カスタム接続先 (ローカルサーバー) はキー無しでも接続テストできる */
+  allowTestWithoutKey?: boolean
 }
 
 // ----- Stage 2-C-1: ホットキー設定セクション -----
@@ -841,6 +690,7 @@ function ApiKeyRow({
   onSave,
   onTest,
   onDelete,
+  allowTestWithoutKey = false,
 }: ApiKeyRowProps) {
   // Phase 2 C Wave 2 AD-02: キー表示切替 Checkbox (Radix UI + Input type=password ↔ text)
   // 入力欄が空のときは「保存済み (●●●...)」の placeholder のみ表示なので切替不要
@@ -869,14 +719,16 @@ function ApiKeyRow({
         <button
           type="button"
           onClick={onTest}
-          disabled={busy || (!value.trim() && !stored)}
+          disabled={busy || (!value.trim() && !stored && !allowTestWithoutKey)}
           className="px-3 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs rounded-md flex items-center gap-1.5 disabled:opacity-50"
           title={
             value.trim()
-              ? '入力欄のキーをテスト'
+              ? '入力欄のキーで接続テスト'
               : stored
-                ? '保存済みキーをテスト'
-                : 'キーを入力してください'
+                ? '保存済みキーで接続テスト'
+                : allowTestWithoutKey
+                  ? 'キー無しで接続テスト'
+                  : 'キーを入力してください'
           }
         >
           <Zap size={12} />
@@ -934,351 +786,6 @@ function ApiKeyRow({
           <span>{revealed ? 'キーを表示中' : 'キーを表示'}</span>
         </span>
       </label>
-    </div>
-  )
-}
-
-// ----- Gateway ログイン (feature/gateway-login): RushVoice アカウント -----
-//
-// 設計 SSOT: 内部設計メモ §A-2-3/A-2-5
-// - 未ログイン: メール入力 →「コードを送信」→ 6 桁コード入力 →「ログイン」
-// - ログイン済: メール・プラン (trial 等)・有効期限を表示 +「ログアウト」
-// - ログイン成功で転写経路が gateway に自動切替 / ログアウトで byok に戻る (Rust 側で実施)
-// - エラーは toast ではなくセクション内インラインテキストで表示 (L337: alert 禁止)
-// - 初期値取得 (gatewayStatus) + 'gateway:auth-changed' listen のセット (L145)
-
-// 2026-07-28: 値は D1 entitlements.plan の実値と一致させる
-// (旧 'basic' は実在しない値で、standard が「standard」と生表示されていた)
-const PLAN_LABEL_JA: Record<string, string> = {
-  trial: 'トライアル',
-  standard: 'スタンダード',
-  pro: 'プロ',
-}
-
-function formatPeriodEnd(rfc3339: string | null): string | null {
-  if (!rfc3339) return null
-  const d = new Date(rfc3339)
-  if (isNaN(d.getTime())) return null
-  return d.toLocaleDateString('ja-JP', { year: 'numeric', month: 'long', day: 'numeric' })
-}
-
-function AccountSection() {
-  const [status, setStatus] = useState<GatewayStatus | null>(null)
-  const [email, setEmail] = useState('')
-  const [code, setCode] = useState('')
-  const [codeSent, setCodeSent] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const [inlineError, setInlineError] = useState<string | null>(null)
-  const [busyPlan, setBusyPlan] = useState<PurchasablePlan | null>(null)
-
-  // 初期取得 + auth-changed listen (L145: invoke 応答だけに頼らない)
-  useEffect(() => {
-    let mounted = true
-    const unlistens: UnlistenFn[] = []
-    ;(async () => {
-      try {
-        const st = await gatewayStatus()
-        if (mounted) setStatus(st)
-      } catch (e) {
-        console.warn('gatewayStatus failed:', e)
-        if (mounted) {
-          setStatus({
-            state: 'error',
-            email: null,
-            plan: null,
-            status: null,
-            current_period_end: null,
-            message: String(e),
-          })
-        }
-      }
-      try {
-        unlistens.push(
-          await listen<GatewayStatus>('gateway:auth-changed', (e) => {
-            if (!mounted) return
-            setStatus(e.payload)
-          }),
-        )
-      } catch (err) {
-        console.warn('AccountSection auth-changed listen failed:', err)
-      }
-    })()
-    return () => {
-      mounted = false
-      for (const u of unlistens) u()
-    }
-  }, [])
-
-  async function handleSendCode() {
-    if (busy) return
-    setInlineError(null)
-    setBusy(true)
-    try {
-      await gatewayRequestCode(email)
-      setCodeSent(true)
-      toast.success('ログインコードをメールに送信しました（10 分有効）')
-    } catch (e) {
-      setInlineError(String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function handleLogin() {
-    if (busy) return
-    setInlineError(null)
-    setBusy(true)
-    try {
-      const st = await gatewayVerifyCode(email, code)
-      setStatus(st)
-      setEmail('')
-      setCode('')
-      setCodeSent(false)
-      toast.success('ログインしました（文字起こしは RushVoice アカウント経由になります）')
-    } catch (e) {
-      setInlineError(String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function handleLogout() {
-    if (busy) return
-    setInlineError(null)
-    setBusy(true)
-    try {
-      await gatewayLogout()
-      // 'gateway:auth-changed' でも更新されるが、即時反映のためここでも設定
-      setStatus({
-        state: 'logged_out',
-        email: null,
-        plan: null,
-        status: null,
-        current_period_end: null,
-        message: null,
-      })
-      setCodeSent(false)
-      toast.success('ログアウトしました（API キー直接利用に戻ります）')
-    } catch (e) {
-      setInlineError(String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  // 2026-07-28: 購入導線。Stripe Checkout を既定ブラウザで開く。
-  // 反映は webhook 経由で数十秒かかるため、完了扱いにはせず案内だけ出す。
-  async function handleBuy(plan: PurchasablePlan) {
-    if (busyPlan) return
-    setInlineError(null)
-    setBusyPlan(plan)
-    try {
-      await gatewayOpenCheckout(plan)
-      toast.success('ブラウザで購入手続きを開きました（完了後、反映まで数十秒かかります）')
-    } catch (e) {
-      setInlineError(String(e))
-    } finally {
-      setBusyPlan(null)
-    }
-  }
-
-  const loggedIn = status?.state === 'active' || status?.state === 'error'
-  const expired = status?.state === 'expired'
-  const loading = status === null
-  const periodEnd = formatPeriodEnd(status?.current_period_end ?? null)
-  const planLabel = status?.plan ? (PLAN_LABEL_JA[status.plan] ?? status.plan) : null
-
-  return (
-    <div className="space-y-4 p-5 bg-neutral-950 border border-neutral-800 rounded-lg">
-      <div className="flex items-center gap-2">
-        <UserRound size={14} className="text-neutral-400" />
-        <h3 className="text-sm font-medium text-neutral-200">RushVoice アカウント</h3>
-        {status?.state === 'active' && (
-          <span className="ml-auto inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium text-emerald-100 bg-emerald-500/20 border border-emerald-500/50 rounded">
-            <Check size={10} />
-            <span>ログイン中</span>
-          </span>
-        )}
-        {expired && (
-          <span className="ml-auto inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium text-amber-100 bg-amber-500/20 border border-amber-500/50 rounded">
-            <AlertTriangle size={10} />
-            <span>再ログインが必要</span>
-          </span>
-        )}
-      </div>
-      <p className="text-xs text-neutral-500">
-        メールアドレスでログインすると、API キーなしで文字起こしを利用できます
-        （転写はゲートウェイ経由に自動で切り替わります）。
-      </p>
-
-      {loading ? (
-        <div className="flex items-center gap-2 text-xs text-neutral-500">
-          <Loader2 size={12} className="animate-spin" />
-          <span>アカウント状態を確認中…</span>
-        </div>
-      ) : loggedIn ? (
-        <div className="space-y-3">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <div className="text-sm text-neutral-100 font-mono">
-                {status?.email ?? '(メール不明)'}
-              </div>
-              <div className="text-xs text-neutral-500 mt-0.5">
-                {planLabel ? `プラン: ${planLabel}` : 'プラン情報なし'}
-                {status?.status ? `（${status.status}）` : ''}
-                {periodEnd ? ` ・有効期限: ${periodEnd}` : ''}
-              </div>
-              {status?.state === 'error' && status.message && (
-                <div className="text-[11px] text-amber-400/80 mt-1">
-                  {status.message}
-                </div>
-              )}
-            </div>
-            <button
-              type="button"
-              onClick={handleLogout}
-              disabled={busy}
-              className="px-3 py-2 bg-neutral-800 hover:bg-red-900 text-neutral-300 hover:text-red-300 text-xs rounded-md flex items-center gap-1.5 disabled:opacity-50"
-            >
-              <LogOut size={12} />
-              <span>ログアウト</span>
-            </button>
-          </div>
-
-          {/* 購入導線 (2026-07-28)。既に pro なら出さない・standard ならプロのみ提示 */}
-          {status?.plan !== 'pro' && (
-            <div className="pt-3 border-t border-neutral-800 space-y-2">
-              <div className="text-xs text-neutral-400">
-                {status?.plan === 'standard'
-                  ? 'プロにアップグレードすると、議事録モードとセミナー字幕が使えます。'
-                  : 'プランを購入すると、トライアル終了後も続けて利用できます。'}
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {PLAN_CATALOG.filter(
-                  ({ plan }) => status?.plan !== 'standard' || plan === 'pro',
-                ).map(({ plan, label, price }) => (
-                  <button
-                    key={plan}
-                    type="button"
-                    onClick={() => void handleBuy(plan)}
-                    disabled={busyPlan !== null || busy}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs rounded-md disabled:opacity-50"
-                  >
-                    {busyPlan === plan ? (
-                      <Loader2 size={12} className="animate-spin" />
-                    ) : (
-                      <ExternalLink size={12} />
-                    )}
-                    <span>
-                      {label} {price}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* インラインエラー (L337: alert 禁止)。
-              購入・ログアウトの失敗はログイン中ブランチで出す必要がある */}
-          {inlineError && (
-            <p
-              role="alert"
-              className="text-xs text-red-300/90 bg-red-500/5 border border-red-500/30 rounded px-2.5 py-1.5"
-            >
-              {inlineError}
-            </p>
-          )}
-        </div>
-      ) : (
-        <div className="space-y-3">
-          {expired && (
-            <p className="text-xs text-amber-300/90 bg-amber-500/5 border border-amber-500/30 rounded px-2.5 py-1.5">
-              ログインの有効期限が切れています。もう一度メールアドレスでログインしてください。
-            </p>
-          )}
-          <div>
-            <label htmlFor="gateway-email" className="block text-xs text-neutral-400 mb-1.5">
-              メールアドレス
-            </label>
-            <div className="flex gap-2">
-              <input
-                id="gateway-email"
-                type="email"
-                placeholder="you@example.com"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && email.trim()) {
-                    e.preventDefault()
-                    void handleSendCode()
-                  }
-                }}
-                disabled={busy}
-                className="flex-1 px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-md text-sm focus:border-[var(--color-brand-500)] focus:outline-none disabled:opacity-60 font-mono"
-              />
-              <button
-                type="button"
-                onClick={handleSendCode}
-                disabled={busy || !email.trim()}
-                className="px-3 py-2 bg-[var(--color-brand-500)] hover:bg-[var(--color-brand-700)] text-white text-xs rounded-md flex items-center gap-1.5 disabled:opacity-50"
-              >
-                <Mail size={12} />
-                <span>{codeSent ? 'コードを再送' : 'コードを送信'}</span>
-              </button>
-            </div>
-          </div>
-
-          {codeSent && (
-            <div>
-              <label htmlFor="gateway-code" className="block text-xs text-neutral-400 mb-1.5">
-                メールに届いた 6 桁コード
-              </label>
-              <div className="flex gap-2">
-                <input
-                  id="gateway-code"
-                  type="text"
-                  inputMode="numeric"
-                  autoComplete="one-time-code"
-                  maxLength={6}
-                  placeholder="123456"
-                  value={code}
-                  onChange={(e) => setCode(e.target.value.replace(/[^0-9]/g, ''))}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && code.trim().length === 6) {
-                      e.preventDefault()
-                      void handleLogin()
-                    }
-                  }}
-                  disabled={busy}
-                  className="w-32 px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-md text-sm tracking-widest focus:border-[var(--color-brand-500)] focus:outline-none disabled:opacity-60 font-mono"
-                />
-                <button
-                  type="button"
-                  onClick={handleLogin}
-                  disabled={busy || code.trim().length !== 6}
-                  className="px-4 py-2 bg-[var(--color-brand-500)] hover:bg-[var(--color-brand-700)] text-white text-xs rounded-md flex items-center gap-1.5 disabled:opacity-50"
-                >
-                  {busy ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
-                  <span>ログイン</span>
-                </button>
-              </div>
-              <p className="text-[11px] text-neutral-600 mt-1">
-                コードの有効期限は 10 分です。届かない場合は再送してください。
-              </p>
-            </div>
-          )}
-
-          {/* インラインエラー (L337: alert 禁止) */}
-          {inlineError && (
-            <p
-              role="alert"
-              className="text-xs text-red-300/90 bg-red-500/5 border border-red-500/30 rounded px-2.5 py-1.5"
-            >
-              {inlineError}
-            </p>
-          )}
-        </div>
-      )}
     </div>
   )
 }
@@ -1588,6 +1095,378 @@ function CongestionSection() {
           </span>
         </span>
       </label>
+    </div>
+  )
+}
+
+// ----- 接続先と API キー (2026-11-15) -----
+//
+// 文字起こし (/audio/transcriptions) と 整文・字幕翻訳・議事録整形 (/chat/completions) の
+// それぞれに接続先を選ぶ。Groq / OpenAI は自分のキー、カスタムは OpenAI 互換の任意のサーバー
+// (Ollama・LM Studio・whisper.cpp server など手元のローカル LLM を含む。キーは任意)。
+// 解決ロジックの正は Rust 側 src-tauri/src/endpoints.rs。
+
+const PROVIDER_LABEL: Record<Provider, string> = {
+  groq: 'Groq',
+  openai: 'OpenAI',
+  custom_transcribe: '文字起こしのカスタム接続先',
+  custom_llm: '整文のカスタム接続先',
+}
+
+function useStoredKey(p: Provider) {
+  const [stored, setStored] = useState(false)
+  useEffect(() => {
+    hasApiKey(p).then(setStored).catch((e) => console.warn('hasApiKey failed:', e))
+  }, [p])
+  return [stored, setStored] as const
+}
+
+function EndpointSection() {
+  const [transcribeProvider, setTranscribeProvider] = useState('hedged')
+  const [llmProvider, setLlmProvider] = useState('groq')
+  const [loaded, setLoaded] = useState(false)
+
+  useEffect(() => {
+    ;(async () => {
+      try {
+        const [t, l] = await Promise.all([
+          getSetting(TRANSCRIBE_PROVIDER_KEY),
+          getSetting(LLM_PROVIDER_KEY),
+        ])
+        if (t) setTranscribeProvider(t)
+        if (l) setLlmProvider(l)
+      } catch (e) {
+        toast.error(`設定読み込み失敗: ${e}`)
+      } finally {
+        setLoaded(true)
+      }
+    })()
+  }, [])
+
+  async function changeSetting(key: string, value: string, set: (v: string) => void) {
+    set(value)
+    try {
+      await setSetting(key, value)
+      toast.success('接続先を保存しました')
+    } catch (e) {
+      toast.error(`保存失敗: ${e}`)
+    }
+  }
+
+  const selectClass =
+    'w-full px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-md text-sm disabled:opacity-60'
+
+  return (
+    <div className="space-y-5 p-5 bg-neutral-950 border border-neutral-800 rounded-lg">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-medium text-neutral-200">接続先と API キー</h3>
+        <div className="flex items-center gap-1.5 text-xs text-emerald-400/80">
+          <Lock size={12} />
+          <span>キーは暗号化して保存</span>
+        </div>
+      </div>
+      <p className="text-xs text-neutral-500 leading-relaxed">
+        自分の Groq / OpenAI の API キー (Groq は無料枠あり) か、OpenAI 互換の接続先
+        (Ollama・LM Studio・whisper.cpp server など手元のローカル LLM も可) で動きます。
+        文字起こしと整文は別々の接続先にできます。
+      </p>
+
+      {/* API キー */}
+      <div className="space-y-4">
+        <ProviderKeyRow provider="groq" placeholderNew="gsk_..." />
+        <ProviderKeyRow provider="openai" placeholderNew="sk-..." />
+      </div>
+
+      {/* 文字起こし */}
+      <div className="space-y-3 pt-4 border-t border-neutral-800">
+        <label className="block text-xs text-neutral-400">文字起こしの接続先</label>
+        <select
+          className={selectClass}
+          value={transcribeProvider}
+          onChange={(e) => changeSetting(TRANSCRIBE_PROVIDER_KEY, e.target.value, setTranscribeProvider)}
+          disabled={!loaded}
+        >
+          <option value="hedged">おすすめ: Groq (遅いときは OpenAI も並走・キーがある方だけでも可)</option>
+          <option value="groq">Groq だけ</option>
+          <option value="openai">OpenAI だけ</option>
+          <option value="custom">カスタム (OpenAI 互換・ローカル可)</option>
+        </select>
+        {transcribeProvider === 'custom' && (
+          <CustomEndpointFields
+            provider="custom_transcribe"
+            baseUrlKey={CUSTOM_TRANSCRIBE_BASE_URL_KEY}
+            modelKey={CUSTOM_TRANSCRIBE_MODEL_KEY}
+            urlPlaceholder="http://127.0.0.1:8080/v1"
+            modelPlaceholder="whisper-1 (空でも可)"
+            hint="例: whisper.cpp server → http://127.0.0.1:8080/v1 ／ faster-whisper 系の OpenAI 互換サーバー → http://localhost:8000/v1 (モデル名はサーバーの指定どおり)。議事録・字幕では verbose_json に対応したサーバーが必要です。"
+          />
+        )}
+      </div>
+
+      {/* 整文・翻訳 */}
+      <div className="space-y-3 pt-4 border-t border-neutral-800">
+        <label className="block text-xs text-neutral-400">整文・字幕翻訳・議事録整形の接続先</label>
+        <select
+          className={selectClass}
+          value={llmProvider}
+          onChange={(e) => changeSetting(LLM_PROVIDER_KEY, e.target.value, setLlmProvider)}
+          disabled={!loaded}
+        >
+          <option value="groq">Groq (llama-3.3-70b)</option>
+          <option value="openai">OpenAI (gpt-4o-mini)</option>
+          <option value="custom">カスタム (OpenAI 互換・ローカル可)</option>
+        </select>
+        {llmProvider === 'custom' && (
+          <CustomEndpointFields
+            provider="custom_llm"
+            baseUrlKey={CUSTOM_LLM_BASE_URL_KEY}
+            modelKey={CUSTOM_LLM_MODEL_KEY}
+            urlPlaceholder="http://localhost:11434/v1"
+            modelPlaceholder="qwen2.5:7b"
+            hint="例: Ollama → http://localhost:11434/v1 (モデル名は ollama list の名前) ／ LM Studio → http://localhost:1234/v1。整文の指示を守れる程度の大きさのモデルをおすすめします。つながらないときは整えずにそのまま貼り付けます。"
+          />
+        )}
+      </div>
+    </div>
+  )
+}
+
+function ProviderKeyRow({ provider, placeholderNew }: { provider: Provider; placeholderNew: string }) {
+  const [input, setInput] = useState('')
+  const [stored, setStored] = useStoredKey(provider)
+  const [busy, setBusy] = useState(false)
+  const name = PROVIDER_LABEL[provider]
+
+  async function save() {
+    if (!input.trim()) return
+    setBusy(true)
+    try {
+      await saveApiKey(provider, input.trim())
+      toast.success(`${name} の API キーを暗号化保存しました`)
+      setInput('')
+      setStored(true)
+    } catch (e) {
+      toast.error(`保存失敗: ${e}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function remove() {
+    if (!confirm(`${name} の API キーを削除しますか？`)) return
+    setBusy(true)
+    try {
+      await deleteApiKey(provider)
+      toast.success(`${name} の API キーを削除しました`)
+      setStored(false)
+    } catch (e) {
+      toast.error(`削除失敗: ${e}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function test() {
+    setBusy(true)
+    try {
+      const r = input.trim() ? await testApiKey(provider, input.trim()) : await testStoredApiKey(provider)
+      if (r.ok) toast.success(`接続成功 (HTTP ${r.status})`)
+      else toast.error(`接続失敗: ${r.message}`)
+    } catch (e) {
+      toast.error(`テスト失敗: ${e}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <ApiKeyRow
+      label={`${name} API キー`}
+      placeholder={stored ? '●●●●●●●●●●●● (保存済み)' : placeholderNew}
+      value={input}
+      onChange={setInput}
+      stored={stored}
+      busy={busy}
+      onSave={save}
+      onTest={test}
+      onDelete={remove}
+    />
+  )
+}
+
+interface CustomEndpointFieldsProps {
+  provider: Provider
+  baseUrlKey: string
+  modelKey: string
+  urlPlaceholder: string
+  modelPlaceholder: string
+  hint: string
+}
+
+function CustomEndpointFields({
+  provider,
+  baseUrlKey,
+  modelKey,
+  urlPlaceholder,
+  modelPlaceholder,
+  hint,
+}: CustomEndpointFieldsProps) {
+  const [baseUrl, setBaseUrl] = useState('')
+  const [model, setModel] = useState('')
+  const [savedUrl, setSavedUrl] = useState('')
+  const [savedModel, setSavedModel] = useState('')
+  const [keyInput, setKeyInput] = useState('')
+  const [keyStored, setKeyStored] = useStoredKey(provider)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    ;(async () => {
+      try {
+        const [u, m] = await Promise.all([getSetting(baseUrlKey), getSetting(modelKey)])
+        setBaseUrl(u ?? '')
+        setSavedUrl(u ?? '')
+        setModel(m ?? '')
+        setSavedModel(m ?? '')
+      } catch (e) {
+        console.warn('custom endpoint load failed:', e)
+      }
+    })()
+  }, [baseUrlKey, modelKey])
+
+  const urlValid = /^https?:\/\/[^/\s]+/.test(baseUrl.trim())
+  const dirty = baseUrl.trim() !== savedUrl || model.trim() !== savedModel
+
+  async function saveFields() {
+    if (!urlValid) {
+      toast.error('URL は http:// か https:// で始めてください')
+      return
+    }
+    setBusy(true)
+    try {
+      await setSetting(baseUrlKey, baseUrl.trim())
+      await setSetting(modelKey, model.trim())
+      setSavedUrl(baseUrl.trim())
+      setSavedModel(model.trim())
+      toast.success('カスタム接続先を保存しました')
+    } catch (e) {
+      toast.error(`保存失敗: ${e}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function test() {
+    if (!urlValid) {
+      toast.error('URL は http:// か https:// で始めてください')
+      return
+    }
+    setBusy(true)
+    try {
+      const r = await testEndpointUrl(provider, baseUrl.trim(), keyInput.trim() || null)
+      if (r.ok) toast.success(r.status ? `${r.message} (HTTP ${r.status})` : r.message)
+      else toast.error(`接続失敗: ${r.message}`)
+    } catch (e) {
+      toast.error(`テスト失敗: ${e}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function saveKey() {
+    if (!keyInput.trim()) return
+    setBusy(true)
+    try {
+      await saveApiKey(provider, keyInput.trim())
+      toast.success('キーを暗号化保存しました')
+      setKeyInput('')
+      setKeyStored(true)
+    } catch (e) {
+      toast.error(`保存失敗: ${e}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function removeKey() {
+    if (!confirm('このカスタム接続先のキーを削除しますか？')) return
+    setBusy(true)
+    try {
+      await deleteApiKey(provider)
+      setKeyStored(false)
+      toast.success('キーを削除しました')
+    } catch (e) {
+      toast.error(`削除失敗: ${e}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const inputClass =
+    'w-full px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-md text-sm focus:border-[var(--color-brand-500)] focus:outline-none disabled:opacity-60 font-mono'
+
+  return (
+    <div className="space-y-3 p-4 bg-neutral-900/60 border border-neutral-800 rounded-md">
+      <div>
+        <label className="block text-xs text-neutral-400 mb-1.5">ベース URL (/v1 まで)</label>
+        <input
+          type="text"
+          inputMode="url"
+          spellCheck={false}
+          placeholder={urlPlaceholder}
+          value={baseUrl}
+          onChange={(e) => setBaseUrl(e.target.value)}
+          className={inputClass}
+          disabled={busy}
+        />
+        {baseUrl.trim() !== '' && !urlValid && (
+          <p className="mt-1 text-[11px] text-amber-400">http:// か https:// で始めてください</p>
+        )}
+      </div>
+      <div>
+        <label className="block text-xs text-neutral-400 mb-1.5">モデル名</label>
+        <input
+          type="text"
+          spellCheck={false}
+          placeholder={modelPlaceholder}
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          className={inputClass}
+          disabled={busy}
+        />
+      </div>
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={test}
+          disabled={busy || !urlValid}
+          className="px-3 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs rounded-md flex items-center gap-1.5 disabled:opacity-50"
+        >
+          <Zap size={12} />
+          <span>接続テスト</span>
+        </button>
+        <button
+          type="button"
+          onClick={saveFields}
+          disabled={busy || !urlValid || !dirty}
+          className="px-3 py-2 bg-[var(--color-brand-500)] hover:bg-[var(--color-brand-700)] text-white text-xs rounded-md flex items-center gap-1.5 disabled:opacity-50"
+        >
+          <Save size={12} />
+          <span>{dirty ? '保存' : '保存済み'}</span>
+        </button>
+      </div>
+      <ApiKeyRow
+        label="キー (任意・ローカルのサーバーなら不要)"
+        placeholder={keyStored ? '●●●●●●●●●●●● (保存済み)' : '空のままで可'}
+        value={keyInput}
+        onChange={setKeyInput}
+        stored={keyStored}
+        busy={busy}
+        onSave={saveKey}
+        onTest={test}
+        onDelete={removeKey}
+        allowTestWithoutKey
+      />
+      <p className="text-[11px] text-neutral-500 leading-relaxed">{hint}</p>
     </div>
   )
 }
