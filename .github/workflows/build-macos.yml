@@ -47,7 +47,7 @@ permissions:
 jobs:
   build-universal:
     name: tauri build (universal-apple-darwin)
-    runs-on: macos-14  # Apple Silicon (M1) runner
+    runs-on: macos-15  # Apple Silicon runner（macos-14 は 2026-11 に使えなくなった）
     timeout-minutes: 60
     # 旧リポにあった continue-on-error: true は撤去 — 専用リポジトリでは build 失敗を赤で可視化する.
 

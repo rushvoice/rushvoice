@@ -29,7 +29,7 @@
 
 ## インストール
 
-[Releases](../../releases) から最新版をダウンロードしてください。
+[Releases](../../releases) から最新版をダウンロードしてください。詳しい手順（AI エージェントに読ませて導入してもらう手順を含む）は [INSTALL.md](INSTALL.md) にあります。
 
 ダウンロードは、このリポジトリの Releases からだけにしてください（ほかのサイトの配布物は公式ではありません）。
 
@@ -72,4 +72,5 @@ RushVoice is a push-to-talk voice input app built with Tauri 2 (Rust) and React.
 - Use all features (transcription, AI rewriting, meeting minutes, live subtitles) with your own [Groq](https://console.groq.com/) API key, billed to your Groq account (Groq has a free tier), or sign in to a paid RushVoice account instead. The paid gateway is not part of this repository.
 - Audio and transcripts are sent to Groq (or OpenAI, if configured) with your own key, or to the RushVoice server when signed in. History, dictionary and settings are stored on your device; some dictionary terms are sent along with the audio to improve recognition.
 - Build: `cargo install tauri-cli --version "^2" --locked`, `cd frontend && pnpm install`, then `cd ../src-tauri && cargo tauri dev`.
+- Install: see [INSTALL.md](INSTALL.md) (includes step-by-step instructions for AI agents).
 - License: Apache-2.0, which does not grant trademark rights. See TRADEMARKS.md for how to use the "RushVoice" name.

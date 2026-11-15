@@ -1,0 +1,148 @@
+name: Release
+
+# タグ v* を push すると、Windows と macOS（universal）のインストーラーを作り、
+# GitHub Release（下書き）に添付する。下書きを確かめてからメンテナーが公開する。
+#
+# - 署名: macOS は ad-hoc（Apple Developer Program は使わない）、Windows は未署名。
+#   ⚠️ APPLE_CERTIFICATE などの署名用 secrets / env を足さない（空でも security import が失敗する）。
+# - RUSHVOICE_GATEWAY_BASE_URL（secret）: 公式版で RushVoice アカウントのログインを有効にするための接続先。
+#   無くてもビルドは通り、その場合は自分の API キーで使う版になる。
+# - タグ push はメンテナーだけができる（外部 PR からは動かない）。
+
+"on":
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release のタグ（例 v0.1.19）"
+        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-universal
+            os: macos-15
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            build_args: --target universal-apple-darwin
+            bundle_dir: src-tauri/target/universal-apple-darwin/release/bundle
+            pattern: "dmg/*.dmg"
+          - name: windows-x64
+            os: windows-latest
+            rust_targets: x86_64-pc-windows-msvc
+            build_args: ""
+            bundle_dir: src-tauri/target/release/bundle
+            pattern: "nsis/*.exe msi/*.msi"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      APPLE_SIGNING_IDENTITY: "-"
+      RUSHVOICE_GATEWAY_BASE_URL: ${{ secrets.RUSHVOICE_GATEWAY_BASE_URL }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.rust_targets }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri -> target
+          key: release-${{ matrix.name }}
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+      - name: Build installers
+        working-directory: src-tauri
+        shell: bash
+        run: cargo tauri build ${{ matrix.build_args }}
+      - name: Collect files
+        shell: bash
+        run: |
+          set -e
+          mkdir -p dist-release
+          cd "${{ matrix.bundle_dir }}"
+          for p in ${{ matrix.pattern }}; do cp $p "$GITHUB_WORKSPACE/dist-release/"; done
+          ls -la "$GITHUB_WORKSPACE/dist-release"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: installers-${{ matrix.name }}
+          path: dist-release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  notices:
+    name: third-party notices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+      - name: Generate THIRD_PARTY_NOTICES.txt
+        run: python3 scripts/third_party_notices.py --out THIRD_PARTY_NOTICES.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: notices
+          path: THIRD_PARTY_NOTICES.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: draft release
+    needs: [build, notices]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -e
+          cd out
+          sha256sum * > SHA256SUMS.txt
+          ls -la
+          gh release create "$TAG" * \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "RushVoice $TAG" \
+            --notes "Windows: RushVoice_*_x64-setup.exe（または .msi）／macOS: RushVoice_*_universal.dmg。署名をしていないため初回に警告が出ます。README の「インストール」を参照してください。SHA256SUMS.txt で配布物の改ざんがないことを確かめられます。"
