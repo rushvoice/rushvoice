@@ -1,0 +1,29 @@
+name: 不具合の報告 / Bug report
+description: 動かない・おかしい動きを報告する
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "脆弱性は Issue に書かず SECURITY.md の窓口へ。ログや画面に個人情報・API キーが写っていないか確かめてから貼ってください。"
+  - type: input
+    id: version
+    attributes: { label: アプリの版 / App version, placeholder: "0.1.19" }
+    validations: { required: true }
+  - type: dropdown
+    id: os
+    attributes: { label: OS, options: [Windows 11, Windows 10, macOS (Apple Silicon), macOS (Intel)] }
+    validations: { required: true }
+  - type: dropdown
+    id: mode
+    attributes: { label: 使い方 / Mode, options: [自分の API キー / Own API key, RushVoice アカウント / Signed in] }
+  - type: textarea
+    id: steps
+    attributes: { label: 再現手順 / Steps to reproduce }
+    validations: { required: true }
+  - type: textarea
+    id: expected
+    attributes: { label: 期待した動きと実際 / Expected vs actual }
+    validations: { required: true }
+  - type: textarea
+    id: logs
+    attributes: { label: ログ / Logs, render: text }

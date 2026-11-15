@@ -1,0 +1,39 @@
+﻿# Secrets
+.env
+.env.local
+config.secrets.encrypted.json
+src-tauri/config.secrets.encrypted.json
+src-tauri/tmp/
+tmp/api_key_raw.txt
+
+# Rust build artifacts
+target/
+src-tauri/target/
+
+# Node modules
+node_modules/
+
+# Vite/build output
+dist/
+
+# Logs
+*.log
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+
+# Cargo.lock はバイナリアプリのため commit する（Day 27 2026-05-28 で除外）
+# 理由: CI で --locked を有効化 + マルチデバイス間 dependency drift 防止
+# src-tauri/Cargo.lock
+
+# ゲートウェイ URL (追跡しない・build.rs がビルド時に埋め込む)
+src-tauri/gateway_url.txt
+gateway_url.txt
+
+# Python の中間ファイル (scripts/ の実行で生成される)
+__pycache__/
+
+# Claude Code の端末ごとの設定（共有しない）
+.claude/settings.local.json

@@ -1,0 +1,11 @@
+name: 要望 / Feature request
+description: あったらよい機能を提案する
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes: { label: 困っていること / Problem }
+    validations: { required: true }
+  - type: textarea
+    id: idea
+    attributes: { label: こうなるとよい / Proposed solution }

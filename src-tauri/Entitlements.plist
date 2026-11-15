@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  mac/mic-permission-prompt (2026-06-15): Hardened Runtime 下でマイク・入力監視・
+  Apple Events を OS に「使う」と宣言する。
+
+  Tauri 2 はデフォルトで Hardened Runtime 有効で署名する (flags=0x10002(adhoc,runtime))。
+  Hardened Runtime はサンドボックスとは別概念で、「アプリが保護リソースにアクセスする」と
+  事前宣言した範囲のみ許可する。Info.plist の Usage Description キーがあっても、
+  Entitlements にこれらの権限が無いと OS は TCC ダイアログを出さずに即 denied で返す
+  (Tahoe 26.x で実機確認)。
+
+  参考:
+  - Apple: "Hardened Runtime" https://developer.apple.com/documentation/security/hardened_runtime
+  - mic 関連の entitlement = `com.apple.security.device.audio-input` (microphone access)
+  - AppleEvents (Cmd+V 自動貼付) = `com.apple.security.automation.apple-events`
+
+  許可しすぎないこと。配布時には不要な entitlement を削る (e.g. JIT, disable-library-validation 等は無し)。
+-->
+<plist version="1.0">
+<dict>
+    <!-- マイク入力 (cpal で録音するため必須) -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- AppleEvents 経由で他アプリへ Cmd+V を送るため (NSAppleEventsUsageDescription とセット) -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+</dict>
+</plist>

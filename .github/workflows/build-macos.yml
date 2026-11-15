@@ -1,0 +1,125 @@
+name: Build Mac Universal Binary
+
+# RushVoice v2 macOS universal binary フルビルド + DMG artifact upload.
+#
+# 出自: 旧リポジトリの build-macos.yml を移植 (2026-07-04).
+#       旧リポでの確立経緯: f820b6a scaffold → e375a8f フルビルド化 → dd6c67e ad-hoc 署名 →
+#       2b13abc 空 APPLE_CERTIFICATE env 削除 (最終版 2026-05-29・v0.1.17 DMG 配布実績あり).
+#       2026-06-14 の専用リポジトリ移設 (git filter-repo は subdir のみ抽出) で引き継がれず消失していた.
+#       移植時の変更点: サブディレクトリのパス前置の除去・
+#       push (main) トリガー追加・continue-on-error 撤去のみ. ビルド手順は実績版そのまま.
+#
+# スコープ:
+#   - cargo tauri build --target universal-apple-darwin で aarch64 + x86_64 同時ビルド.
+#   - .dmg / .app.tar.gz を GitHub Actions artifact として upload (retention 30 日).
+#   - hdiutil verify で DMG 健全性検証.
+#
+# 配布前提:
+#   - Apple Developer Program は使わない. codesign / notarization 完全スキップ.
+#   - APPLE_SIGNING_IDENTITY="-" の ad-hoc 署名 (tauri.conf.json bundle.macOS.signingIdentity と二重指定).
+#   - ⚠️ APPLE_CERTIFICATE / APPLE_ID 等の env / secrets をこのワークフローに追加しないこと.
+#     空文字 "" でも Tauri が「import すべき証明書」と解釈し security import で失敗する
+#     (旧リポで 3 回の試行を経て確定した罠).
+#
+# トリガーと無料枠:
+#   - push (main) + workflow_dispatch. *.md / .claude/ のみの変更はビルドしない.
+#   - macOS runner は分数 10 倍消費. 無料枠 2,000 min/月 = macOS 実質 200 min.
+#     実行時間の実績: 初回 15-25 分 / キャッシュヒット後 8-12 分 → main への push は月 10-20 回が上限目安.
+#     枠が逼迫したら push トリガーを外して workflow_dispatch のみへ戻す.
+
+"on":
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**.md"
+      - ".claude/**"
+  workflow_dispatch:
+
+# 同一 ref で連続 push した場合は古い run をキャンセル (無料枠節約).
+concurrency:
+  group: build-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-universal:
+    name: tauri build (universal-apple-darwin)
+    runs-on: macos-14  # Apple Silicon (M1) runner
+    timeout-minutes: 60
+    # 旧リポにあった continue-on-error: true は撤去 — 専用リポジトリでは build 失敗を赤で可視化する.
+
+    env:
+      # ad-hoc 配布前提 — codesign / notarization を明示的にスキップ.
+      APPLE_SIGNING_IDENTITY: "-"
+      # APPLE_CERTIFICATE / APPLE_ID 等はここに追加しない (ヘッダコメント参照).
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri -> target
+          key: macos-universal-build
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies (frozen)
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Tauri CLI (Rust)
+        # frontend/package.json に @tauri-apps/cli が無いため Rust 版 CLI を導入.
+        # --locked で lockfile 整合を強制. ^2 で Tauri 2.x 系最新を取得.
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build universal binary (aarch64 + x86_64)
+        working-directory: src-tauri
+        # universal-apple-darwin = aarch64 + x86_64 両方をビルドし lipo で 1 つの実行ファイルに束ねる.
+        # bundle.targets = "all" (tauri.conf.json) なので .app / .dmg / .app.tar.gz が生成される.
+        run: cargo tauri build --target universal-apple-darwin --verbose
+
+      - name: Verify DMG integrity (hdiutil)
+        # DMG が壊れていないか hdiutil verify でチェック. universal binary の lipo 失敗等を早期検知.
+        working-directory: src-tauri
+        run: |
+          set -e
+          DMG_PATH=$(ls target/universal-apple-darwin/release/bundle/dmg/*.dmg | head -1)
+          echo "Verifying DMG: $DMG_PATH"
+          hdiutil verify "$DMG_PATH"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rushvoice-mac-dmg-${{ github.sha }}
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload .app.tar.gz artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rushvoice-mac-app-${{ github.sha }}
+          path: src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+          if-no-files-found: warn
+          retention-days: 30
