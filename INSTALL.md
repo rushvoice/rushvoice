@@ -48,69 +48,85 @@ AI に頼むときは「`https://github.com/rushvoice/rushvoice/blob/main/INSTAL
 
 ## 2. AI エージェントが進める手順 / Instructions for AI agents
 
-You are installing RushVoice on the user's computer. Follow these steps in order. Ask the user before anything marked **[user]**.
+You are installing RushVoice on the user's computer. Follow these steps in order. Steps marked **[user]** need the user's action or explicit approval: explain why, then wait.
 
 **Rules**
 - Download only from `https://github.com/rushvoice/rushvoice/releases`. Never from other sites.
-- Verify the SHA-256 checksum against `SHA256SUMS.txt` from the same release before running anything.
+- Verify the SHA-256 checksum against `SHA256SUMS.txt` from the same release before running anything. Stop if it does not match.
 - Never ask the user to paste their API key into the chat. The user enters it in the app's Settings screen themselves.
-- Do not disable OS security features globally (no `spctl --master-disable`, no turning off SmartScreen or Defender).
+- Do not disable OS security features (no `spctl --master-disable`, no turning off SmartScreen or Defender).
 
 ### Step 1: Detect the OS
 - Windows: `[System.Environment]::OSVersion` (PowerShell). Requires Windows 10/11 x64.
 - macOS: `sw_vers -productVersion` and `uname -m`. Requires macOS 13+.
 
-### Step 2: Download the latest release and verify it
+### Step 2 (Windows): download, verify, install
 
-Windows (PowerShell):
+Works in Windows PowerShell 5.1 and PowerShell 7.
 ```powershell
-$rel = Invoke-RestMethod https://api.github.com/repos/rushvoice/rushvoice/releases/latest
-$asset = $rel.assets | Where-Object { $_.name -like "*_x64-setup.exe" } | Select-Object -First 1
-$sums  = $rel.assets | Where-Object { $_.name -eq "SHA256SUMS.txt" }
-$dir = Join-Path $env:TEMP "rushvoice-install"; New-Item -ItemType Directory -Force $dir | Out-Null
-Invoke-WebRequest $asset.browser_download_url -OutFile (Join-Path $dir $asset.name)
-Invoke-WebRequest $sums.browser_download_url  -OutFile (Join-Path $dir "SHA256SUMS.txt")
-$expected = (Select-String -Path (Join-Path $dir "SHA256SUMS.txt") -Pattern ([regex]::Escape($asset.name))).Line.Split(" ")[0]
-$actual = (Get-FileHash (Join-Path $dir $asset.name) -Algorithm SHA256).Hash.ToLower()
-if ($expected -ne $actual) { throw "checksum mismatch" } else { "checksum ok" }
+$ErrorActionPreference = 'Stop'
+$rel   = Invoke-RestMethod -UseBasicParsing https://api.github.com/repos/rushvoice/rushvoice/releases/latest
+$asset = @($rel.assets | Where-Object { $_.name -like '*_x64-setup.exe' })[0]
+$sums  = @($rel.assets | Where-Object { $_.name -eq 'SHA256SUMS.txt' })[0]
+if (-not $asset -or -not $sums) { throw 'installer or SHA256SUMS.txt not found in the latest release' }
+$dir = Join-Path $env:TEMP 'rushvoice-install'
+New-Item -ItemType Directory -Force $dir | Out-Null
+$exe = Join-Path $dir $asset.name
+Invoke-WebRequest -UseBasicParsing $asset.browser_download_url -OutFile $exe
+Invoke-WebRequest -UseBasicParsing $sums.browser_download_url  -OutFile (Join-Path $dir 'SHA256SUMS.txt')
+$lines = @(Get-Content (Join-Path $dir 'SHA256SUMS.txt') | Where-Object {
+  $p = $_ -split '\s+', 2; $p.Count -eq 2 -and $p[1].TrimStart('*') -ceq $asset.name })
+if ($lines.Count -ne 1) { throw 'checksum line not found exactly once' }
+$expected = ($lines[0] -split '\s+')[0].ToLower()
+$actual   = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+if ($expected -ne $actual) { throw 'checksum mismatch - do not run the installer' }
+'checksum ok'
+$p = Start-Process -FilePath $exe -ArgumentList '/S' -Wait -PassThru
+if ($p.ExitCode -ne 0) { throw "installer exit code $($p.ExitCode)" }
+$app = @("$env:LOCALAPPDATA\RushVoice\app.exe", "$env:ProgramFiles\RushVoice\app.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $app) { throw 'installed app not found' }
+Start-Process $app
 ```
+The installed executable is named `app.exe`; the Start menu entry is "RushVoice".
 
-macOS (zsh):
+### Step 2 (macOS): download, verify, install
+
 ```bash
-set -e
+set -euo pipefail
 DIR="$(mktemp -d)"; cd "$DIR"
-API=https://api.github.com/repos/rushvoice/rushvoice/releases/latest
-URL=$(curl -fsSL "$API" | grep -o '"browser_download_url": *"[^"]*_universal\.dmg"' | head -1 | cut -d'"' -f4)
-SUMS=$(curl -fsSL "$API" | grep -o '"browser_download_url": *"[^"]*SHA256SUMS\.txt"' | head -1 | cut -d'"' -f4)
-curl -fsSLO "$URL"; curl -fsSLO "$SUMS"
-shasum -a 256 -c SHA256SUMS.txt --ignore-missing
+curl -fsSL https://api.github.com/repos/rushvoice/rushvoice/releases/latest -o release.json
+DMG_URL=$(grep -o '"browser_download_url": *"[^"]*_universal\.dmg"' release.json | head -1 | cut -d'"' -f4)
+SUMS_URL=$(grep -o '"browser_download_url": *"[^"]*/SHA256SUMS\.txt"' release.json | head -1 | cut -d'"' -f4)
+[ -n "$DMG_URL" ] && [ -n "$SUMS_URL" ] || { echo "release assets not found"; exit 1; }
+DMG="${DMG_URL##*/}"
+curl -fsSLo "$DMG" "$DMG_URL"
+curl -fsSLo SHA256SUMS.txt "$SUMS_URL"
+LINE=$(awk -v f="$DMG" '{n=$2; sub(/^\*/,"",n); if (n==f) print}' SHA256SUMS.txt)
+[ "$(printf '%s\n' "$LINE" | grep -c .)" = "1" ] || { echo "checksum line not found exactly once"; exit 1; }
+printf '%s\n' "$LINE" | shasum -a 256 -c -
 ```
 
-### Step 3: Install
+Before copying, check for an existing install:
+- If `/Applications/RushVoice.app` exists: **[user]** ask the user to quit RushVoice and confirm replacing it. Then remove the old app with `rm -rf /Applications/RushVoice.app` (only that path).
 
-Windows: run the installer silently, then start the app.
-```powershell
-Start-Process -FilePath (Join-Path $dir $asset.name) -ArgumentList "/S" -Wait
-Start-Process "$env:LOCALAPPDATA\RushVoice\app.exe"
-```
-The installed executable is named `app.exe` (the Start menu entry is "RushVoice"). If it is not at that path, search `$env:LOCALAPPDATA\RushVoice` and `$env:ProgramFiles\RushVoice`.
-
-macOS: copy the app into /Applications and remove the download quarantine flag for this app only.
 ```bash
-DMG=$(ls *_universal.dmg | head -1)
-MNT=$(hdiutil attach "$DMG" -nobrowse | tail -1 | awk -F'\t' '{print $NF}')
+MNT="$DIR/mnt"; mkdir -p "$MNT"
+hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MNT"
+trap 'hdiutil detach "$MNT" >/dev/null 2>&1 || true' EXIT
+[ -d "$MNT/RushVoice.app" ] || { echo "RushVoice.app not found in dmg"; exit 1; }
 cp -R "$MNT/RushVoice.app" /Applications/
-hdiutil detach "$MNT"
-xattr -dr com.apple.quarantine /Applications/RushVoice.app
-open /Applications/RushVoice.app
 ```
 
-### Step 4: Things only the user can do — explain them and wait
+The app is not notarized by Apple, so macOS will block the first launch. **[user]** Explain this and ask which way the user prefers:
+1. The user opens it themselves: Finder → Applications → right-click RushVoice → Open (or System Settings → Privacy & Security → "Open Anyway"). Recommended.
+2. With the user's explicit approval, remove the download flag for this one app only: `xattr -dr com.apple.quarantine /Applications/RushVoice.app`, then `open /Applications/RushVoice.app`.
+
+### Step 3: Things only the user can do — explain them and wait
 - **[user]** macOS: allow **Microphone** and **Accessibility** for RushVoice (System Settings → Privacy & Security), then quit and reopen RushVoice.
 - **[user]** Open RushVoice → 設定 (Settings) → API キー, paste a Groq API key from https://console.groq.com/keys and save. Or sign in to a RushVoice account from Settings.
 - **[user]** macOS: choose a hotkey in 設定 (the default Windows key 無変換 does not exist on Mac keyboards).
 
-### Step 5: Verify
+### Step 4: Verify
 Ask the user to open a text editor, press the hotkey (Windows default: Ctrl + Shift + 無変換), speak, and press it again. Text should appear at the cursor. If not, use the troubleshooting table in section 1.
 
 ---
@@ -118,15 +134,16 @@ Ask the user to open a text editor, press the hotkey (Windows default: Ctrl + Sh
 ## 3. ソースからビルドする / Build from source
 
 前提: Rust（rustup）・Node.js 20 以上・pnpm 9。Windows は MSVC ビルドツール、macOS は Xcode Command Line Tools。
+1行ずつ実行してください（Windows PowerShell 5.1 でも動きます）。
 
 ```bash
 git clone https://github.com/rushvoice/rushvoice.git
 cd rushvoice
 cargo install tauri-cli --version "^2" --locked
-cd frontend && pnpm install
+cd frontend
+pnpm install
 cd ../src-tauri
-cargo tauri dev     # 開発用に起動
-cargo tauri build   # インストーラーを作る
+cargo tauri dev
 ```
 
-自分でビルドした版は、RushVoice アカウントのログインが無効で、自分の API キーで動きます。
+インストーラーを作るときは、最後の行を `cargo tauri build` にします。自分でビルドした版は RushVoice アカウントのログインが無効で、自分の API キーで動きます。

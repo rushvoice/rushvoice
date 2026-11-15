@@ -27,11 +27,18 @@ def run(cmd: list[str], cwd: pathlib.Path) -> str:
     ).stdout
 
 
-def license_texts(pkg_dir: pathlib.Path) -> list[tuple[str, str]]:
+MISSING: list[str] = []
+
+
+def license_texts(pkg_dir: pathlib.Path, extra: pathlib.Path | None = None) -> list[tuple[str, str]]:
     texts = []
+    if extra is not None and extra.is_file():
+        texts.append((extra.name, extra.read_text(encoding="utf-8", errors="replace").strip()))
     if not pkg_dir.is_dir():
         return texts
     for f in sorted(pkg_dir.iterdir()):
+        if extra is not None and f.resolve() == extra.resolve():
+            continue
         if f.is_file() and f.name.lower().startswith(LICENSE_PREFIXES):
             try:
                 texts.append((f.name, f.read_text(encoding="utf-8", errors="replace").strip()))
@@ -52,6 +59,8 @@ def rust_packages() -> list[dict]:
             "license": p.get("license") or "(see license file)",
             "url": p.get("repository") or p.get("homepage") or "",
             "dir": pathlib.Path(p["manifest_path"]).parent,
+            "license_file": (pathlib.Path(p["manifest_path"]).parent / p["license_file"])
+            if p.get("license_file") else None,
         })
     return sorted(out, key=lambda x: (x["name"], x["version"]))
 
@@ -78,8 +87,9 @@ def render(section: str, pkgs: list[dict]) -> list[str]:
         lines.append(f"{p['name']} {p['version']}  [{p['license']}]")
         if p["url"]:
             lines.append(p["url"])
-        texts = license_texts(p["dir"])
+        texts = license_texts(p["dir"], p.get("license_file"))
         if not texts:
+            MISSING.append(f"{p['name']} {p['version']} [{p['license']}]")
             lines.append("(No license file was included in the package; license: "
                          f"{p['license']})")
         for name, text in texts:
@@ -101,8 +111,12 @@ def main() -> int:
     ]
     lines += render("Rust crates", rust_packages())
     lines += render("JavaScript packages (frontend)", npm_packages())
+    if MISSING:
+        lines += ["==== Packages without a bundled license file ====",
+                  "These packages declare the SPDX license shown; the standard text of that license applies.",
+                  ""] + MISSING
     pathlib.Path(args.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"wrote {args.out}")
+    print(f"wrote {args.out} (packages without a license file: {len(MISSING)})")
     return 0
 
 

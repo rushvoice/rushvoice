@@ -42,7 +42,8 @@
 
 ```bash
 cargo install tauri-cli --version "^2" --locked
-cd frontend && pnpm install
+cd frontend
+pnpm install
 cd ../src-tauri
 cargo tauri dev     # 開発用に起動
 cargo tauri build   # 配布用にビルド

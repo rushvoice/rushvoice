@@ -7,17 +7,12 @@ name: Release
 #   ⚠️ APPLE_CERTIFICATE などの署名用 secrets / env を足さない（空でも security import が失敗する）。
 # - RUSHVOICE_GATEWAY_BASE_URL（secret）: 公式版で RushVoice アカウントのログインを有効にするための接続先。
 #   無くてもビルドは通り、その場合は自分の API キーで使う版になる。
-# - タグ push はメンテナーだけができる（外部 PR からは動かない）。
+# - タグ v* を作れるのは Org の管理者だけ（リポジトリの ruleset で制限）。外部 PR からは動かない。
 
 "on":
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release のタグ（例 v0.1.19）"
-        required: true
 
 concurrency:
   group: release-${{ github.ref }}
@@ -81,9 +76,12 @@ jobs:
         shell: bash
         run: |
           set -e
+          shopt -s nullglob
           mkdir -p dist-release
           cd "${{ matrix.bundle_dir }}"
-          for p in ${{ matrix.pattern }}; do cp $p "$GITHUB_WORKSPACE/dist-release/"; done
+          files=( ${{ matrix.pattern }} )
+          if [ ${#files[@]} -eq 0 ]; then echo "no installer found"; exit 1; fi
+          cp -- "${files[@]}" "$GITHUB_WORKSPACE/dist-release/"
           ls -la "$GITHUB_WORKSPACE/dist-release"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -134,15 +132,17 @@ jobs:
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TAG: ${{ github.ref_name }}
         shell: bash
         run: |
           set -e
           cd out
-          sha256sum * > SHA256SUMS.txt
-          ls -la
+          sha256sum -- * > ../SHA256SUMS.txt
+          mv ../SHA256SUMS.txt SHA256SUMS.txt
+          cat SHA256SUMS.txt
           gh release create "$TAG" * \
             --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
             --draft \
             --title "RushVoice $TAG" \
             --notes "Windows: RushVoice_*_x64-setup.exe（または .msi）／macOS: RushVoice_*_universal.dmg。署名をしていないため初回に警告が出ます。README の「インストール」を参照してください。SHA256SUMS.txt で配布物の改ざんがないことを確かめられます。"
