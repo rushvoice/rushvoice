@@ -142,7 +142,7 @@ pub fn build_system_prompt(
 // 事故が増えるため (伸長ガードと max_tokens は最後の網であって品質の担保ではない・L582)。
 // 2026-07-25 指摘: 無料枠の日次トークン上限 (TPD) を使い切ると後処理が丸ごと止まり、
 // 素の Whisper 出力が貼られて「精度が落ちた」ように見える (L583 と同じ見え方)。
-// 上限に当たったら**品質は落ちても止めない**ため、退避先 (ChatEndpoint.fallback_model) がある
+// 上限に当たったら**品質は落ちても止めない**ため、次の候補 (ChatEndpoint.candidates) がある
 // 接続先では日次枠の大きい小型モデルへ退避する。
 
 /// これを超える Retry-After は「日次上限の枯渇」とみなし、待たずに原文へフォールバックする。
@@ -184,15 +184,25 @@ pub fn should_retry_rate_limit(status: u16, retry_after: Option<f64>, attempt: u
     matches!(retry_after, Some(w) if w > 0.0 && w <= MAX_RETRY_AFTER_SECS)
 }
 
-/// 429 で待っても復帰しない (= 日次枠の枯渇) とき、小型モデルへ退避してよいかを判定する。
-/// 退避先が無い接続先 (OpenAI・カスタム) では退避しない。
-/// 退避は 1 度きり。既にフォールバック中なら諦めて原文を返す (L294: 純粋関数)。
-pub fn should_switch_to_fallback_model(
-    status: u16,
-    current_model: &str,
-    fallback_model: Option<&str>,
-) -> bool {
-    matches!(fallback_model, Some(f) if status == 429 && current_model != f)
+/// 次のモデル候補へ進む理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchReason {
+    /// 429 で待っても復帰しない (= 日次枠の枯渇)
+    DailyQuota,
+    /// そのモデルが無い・廃止された (404 model_not_found / 400 model_decommissioned)
+    ModelUnavailable,
+}
+
+/// 失敗した応答から、次の候補へ進むべきかを判定する (純粋関数)。
+/// 鍵の誤り (401) やサーバー障害 (5xx) は候補を変えても直らないので進まない。
+pub fn next_model_reason(status: u16, body: &str) -> Option<SwitchReason> {
+    if status == 429 {
+        return Some(SwitchReason::DailyQuota);
+    }
+    if crate::endpoints::is_model_unavailable(status, body) {
+        return Some(SwitchReason::ModelUnavailable);
+    }
+    None
 }
 
 /// 後処理の振る舞いを決めるプロファイル由来の設定。
@@ -278,6 +288,14 @@ pub async fn apply_llm_postprocess(
         reasoning_effort: crate::endpoints::reasoning_effort_for(&endpoint.model),
     };
     let base_max_tokens = max_tokens_for(text, allow_template_expansion);
+    // モデル候補 (前から順に試す)。/models に無い候補・廃止済みの候補は先に外す。
+    let candidates = crate::endpoints::usable_candidates(client, endpoint).await;
+    let mut cand_idx = 0usize;
+    if let Some(first) = candidates.first() {
+        request.model = first.clone();
+        request.max_tokens = crate::endpoints::with_reasoning_headroom(first, base_max_tokens);
+        request.reasoning_effort = crate::endpoints::reasoning_effort_for(first);
+    }
 
     // 2026-07-25 報告 (後処理が黙って止まる): 旧実装は status だけ見て本文を捨てていたため、
     // 429 が「分単位のレート制限」なのか「日次上限の枯渇」なのか切り分けられなかった。
@@ -328,20 +346,35 @@ pub async fn apply_llm_postprocess(
             tokio::time::sleep(std::time::Duration::from_secs_f64(wait)).await;
             continue;
         }
-        // 待っても復帰しない 429 = 日次枠の枯渇。後処理を丸ごと諦めるより、
-        // 小型モデルで続行するほうが実害が小さい (素の Whisper 出力が貼られるのを防ぐ)。
-        let fallback = endpoint.fallback_model.as_deref();
-        if should_switch_to_fallback_model(status.as_u16(), &request.model, fallback) {
-            let fb = fallback.unwrap_or_default().to_string();
-            log::warn!(
-                "[llm_postprocess] daily quota exhausted on {}; falling back to {}",
-                request.model,
-                fb
-            );
-            request.max_tokens = crate::endpoints::with_reasoning_headroom(&fb, base_max_tokens);
-            request.reasoning_effort = crate::endpoints::reasoning_effort_for(&fb);
-            request.model = fb;
-            continue;
+        // 待っても復帰しない 429 (日次枠の枯渇) と、モデルの廃止は、次の候補で続ける。
+        // 後処理を丸ごと諦めるより実害が小さい (素の Whisper 出力が貼られるのを防ぐ)。
+        if let Some(reason) = next_model_reason(status.as_u16(), &body) {
+            if reason == SwitchReason::ModelUnavailable {
+                crate::endpoints::mark_model_unavailable(endpoint, &request.model);
+            }
+            if cand_idx + 1 < candidates.len() {
+                cand_idx += 1;
+                let next = candidates[cand_idx].clone();
+                log::warn!(
+                    "[llm_postprocess] {:?} on {}; switching to {}",
+                    reason,
+                    request.model,
+                    next
+                );
+                request.max_tokens = crate::endpoints::with_reasoning_headroom(&next, base_max_tokens);
+                request.reasoning_effort = crate::endpoints::reasoning_effort_for(&next);
+                request.model = next;
+                attempt = 0;
+                continue;
+            }
+            if reason == SwitchReason::ModelUnavailable {
+                log::error!(
+                    "[llm_postprocess] no usable model left on {} (tried {:?}); model update needed",
+                    endpoint.label,
+                    candidates
+                );
+                crate::endpoints::set_model_update_needed(true);
+            }
         }
         return text.to_string();
     };
@@ -911,20 +944,18 @@ mod tests {
 
     /// 2026-07-25: 日次枠の枯渇時に小型モデルへ退避する判定
     #[test]
-    fn test_should_switch_to_fallback_model() {
-        // 既定モデルで 429 → 小型モデルへ退避する
-        use crate::endpoints::{GROQ_CHAT_FALLBACK_MODEL as FALLBACK_MODEL, GROQ_CHAT_MODEL as PRIMARY_MODEL};
-        let fb = Some(FALLBACK_MODEL);
-        assert!(should_switch_to_fallback_model(429, PRIMARY_MODEL, fb));
-        // 退避先が無い接続先 (OpenAI・カスタム) では切り替えない
-        assert!(!should_switch_to_fallback_model(429, "qwen2.5:7b", None));
-        // 既に小型モデル → これ以上退避先がないので諦める (無限ループ防止)
-        assert!(!should_switch_to_fallback_model(429, FALLBACK_MODEL, fb));
-        // 429 以外は退避しない (キー不正・障害はモデルを変えても直らない)
-        assert!(!should_switch_to_fallback_model(401, PRIMARY_MODEL, fb));
-        assert!(!should_switch_to_fallback_model(500, PRIMARY_MODEL, fb));
-        // 退避先は既定と別モデルであること (定数の取り違え防止)
-        assert_ne!(PRIMARY_MODEL, FALLBACK_MODEL);
+    fn test_next_model_reason() {
+        assert_eq!(next_model_reason(429, ""), Some(SwitchReason::DailyQuota));
+        let gone = r#"{"error":{"code":"model_not_found","message":"The model `llama-3.3-70b-versatile` does not exist"}}"#;
+        assert_eq!(next_model_reason(404, gone), Some(SwitchReason::ModelUnavailable));
+        assert_eq!(
+            next_model_reason(400, r#"{"error":{"code":"model_decommissioned"}}"#),
+            Some(SwitchReason::ModelUnavailable)
+        );
+        // 鍵の誤り・サーバー障害・ほかの 400 は候補を変えても直らない
+        assert_eq!(next_model_reason(401, "invalid api key"), None);
+        assert_eq!(next_model_reason(500, "model overloaded"), None);
+        assert_eq!(next_model_reason(400, "invalid json"), None);
     }
 
     #[test]
