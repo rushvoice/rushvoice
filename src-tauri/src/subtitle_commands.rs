@@ -375,17 +375,21 @@ async fn translate_chat(
             context, text
         )
     };
+    // モデル候補 (前から順に試す・整文と同じ)
+    let candidates = crate::endpoints::usable_candidates(client, endpoint).await;
+    let mut idx = 0usize;
+    let first = candidates.first().cloned().unwrap_or_else(|| endpoint.model.clone());
     let mut req = serde_json::json!({
-        "model": endpoint.model,
+        "model": first,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        "max_tokens": crate::endpoints::with_reasoning_headroom(&endpoint.model, 1024),
+        "max_tokens": crate::endpoints::with_reasoning_headroom(&first, 1024),
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
     });
-    if let Some(effort) = crate::endpoints::reasoning_effort_for(&endpoint.model) {
+    if let Some(effort) = crate::endpoints::reasoning_effort_for(&first) {
         req["reasoning_effort"] = serde_json::json!(effort);
     }
     // JSON モード (response_format) を受け付けないローカルサーバーがあるため、
@@ -405,12 +409,42 @@ async fn translate_chat(
                 return None;
             }
         };
-        if resp.status().as_u16() == 400 && attempt == 1 {
-            log::info!("[subtitle] translate HTTP 400 from {}; retrying without response_format", endpoint.label);
-            if let Some(obj) = req.as_object_mut() {
-                obj.remove("response_format");
+        let st = resp.status().as_u16();
+        if st == 400 || st == 404 || st == 429 {
+            let body = resp.text().await.unwrap_or_default();
+            let unavailable = crate::endpoints::is_model_unavailable(st, &body);
+            if (st == 429 || unavailable) && idx + 1 < candidates.len() {
+                if unavailable {
+                    crate::endpoints::mark_model_unavailable(endpoint, &candidates[idx]);
+                }
+                idx += 1;
+                let next = candidates[idx].clone();
+                log::warn!("[subtitle] translate HTTP {} on {}; switching to {}", st, candidates[idx - 1], next);
+                req["max_tokens"] = serde_json::json!(crate::endpoints::with_reasoning_headroom(&next, 1024));
+                match crate::endpoints::reasoning_effort_for(&next) {
+                    Some(e) => req["reasoning_effort"] = serde_json::json!(e),
+                    None => {
+                        if let Some(obj) = req.as_object_mut() {
+                            obj.remove("reasoning_effort");
+                        }
+                    }
+                }
+                req["model"] = serde_json::json!(next);
+                attempt = 0;
+                continue;
             }
-            continue;
+            if st == 400 && !unavailable && attempt == 1 {
+                log::info!("[subtitle] translate HTTP 400 from {}; retrying without response_format", endpoint.label);
+                if let Some(obj) = req.as_object_mut() {
+                    obj.remove("response_format");
+                }
+                continue;
+            }
+            if unavailable {
+                crate::endpoints::set_model_update_needed(true);
+            }
+            log::warn!("[subtitle] translate HTTP {} from {}: {}", st, endpoint.label, body.chars().take(300).collect::<String>());
+            return None;
         }
         break resp;
     };

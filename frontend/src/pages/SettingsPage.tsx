@@ -1221,15 +1221,15 @@ function EndpointSection() {
         {llmProvider === 'groq' && (
           <ModelOverrideField
             settingKey={GROQ_LLM_MODEL_KEY}
-            defaultModel="openai/gpt-oss-120b"
-            hint="空なら既定 (openai/gpt-oss-120b・日次の上限に当たったら openai/gpt-oss-20b)。Groq がモデルを入れ替えたときは、Groq のモデル一覧にある名前を入れてください。"
+            defaultModel="openai/gpt-oss-120b, qwen/qwen3.8-27b, openai/gpt-oss-20b"
+            hint="空なら既定の候補を前から順に使います (使えないモデル・日次の上限に当たったモデルは次へ)。Groq がモデルを入れ替えて全部使えなくなったときは、Groq のモデル一覧にある名前をカンマ区切りで入れてください。"
           />
         )}
         {llmProvider === 'openai' && (
           <ModelOverrideField
             settingKey={OPENAI_LLM_MODEL_KEY}
-            defaultModel="gpt-4o-mini"
-            hint="空なら既定 (gpt-4o-mini)。"
+            defaultModel="gpt-4o-mini, gpt-4.1-mini"
+            hint="空なら既定の候補を前から順に使います。カンマ区切りで複数指定できます。"
           />
         )}
         {llmProvider === 'custom' && (
@@ -1277,7 +1277,7 @@ function ModelOverrideField({
     try {
       await setSetting(settingKey, value.trim())
       setSaved(value.trim())
-      toast.success(value.trim() ? `整文のモデルを ${value.trim()} にしました` : '整文のモデルを既定に戻しました')
+      toast.success(value.trim() ? `整文のモデルを「${value.trim()}」にしました` : '整文のモデルを既定に戻しました')
     } catch (e) {
       toast.error(`保存失敗: ${e}`)
     } finally {
@@ -1287,7 +1287,7 @@ function ModelOverrideField({
 
   return (
     <div className="space-y-1.5">
-      <label className="block text-xs text-neutral-400">モデル名 (空なら既定)</label>
+      <label className="block text-xs text-neutral-400">モデル名 (カンマ区切りで複数可・前から順に試す・空なら既定)</label>
       <div className="flex gap-2">
         <input
           type="text"

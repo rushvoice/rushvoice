@@ -1183,7 +1183,7 @@ pub(crate) async fn apply_profile_postprocess(app: &AppHandle, text: &str) -> St
     // 「ていねい」「メール」は敬体化が仕様なので、敬語化の検出対象から外す
     // (仕様どおりの動作を誤検知すると、ナチュラルでの本当の敬語化がログに埋もれる)
     let allow_style_change = allow_template_expansion || active_key == "business_doc";
-    apply_llm_postprocess(
+    let out = apply_llm_postprocess(
         &client,
         &endpoint,
         &prompt,
@@ -1195,7 +1195,12 @@ pub(crate) async fn apply_profile_postprocess(app: &AppHandle, text: &str) -> St
             allow_style_change,
         },
     )
-    .await
+    .await;
+    // 候補をすべて試してもモデルが無かった → 画面に「モデルの更新が必要」と出す (原文は貼る)
+    if crate::endpoints::take_model_update_needed() {
+        let _ = app.emit("llm-model-unavailable", ());
+    }
+    out
 }
 
 // ----- v0.1.10 機能 A: 混雑通知バナー設定 -----

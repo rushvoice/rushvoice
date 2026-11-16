@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { Toaster } from 'sonner'
+import { useEffect, useRef, useState } from 'react'
+import { Toaster, toast } from 'sonner'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { Sidebar, type PageKey } from './components/Sidebar'
 import { HotkeyConflictDialog } from './components/HotkeyConflictDialog'
@@ -20,6 +20,8 @@ function App() {
   // v0.1.16 機能 L Day 4: 議事録録音中フラグ (CEO 推奨方針 4: HomePage 録音ボタンの併用抑止情報源)
   // 現状は Sidebar の議事録録音中 hint 用 reserved (HomePage の disable は Day 5 検討)。
   const [meetingRecording, setMeetingRecording] = useState(false)
+  // 整文のモデルが使えないときの知らせ (同じ知らせを続けて出しすぎない)
+  const lastModelWarnAt = useRef(0)
 
   useEffect(() => {
     let mounted = true
@@ -34,6 +36,24 @@ function App() {
         )
       } catch (e) {
         console.warn('[app] meeting state listen failed:', e)
+      }
+      try {
+        unlistens.push(
+          await listen('llm-model-unavailable', () => {
+            if (!mounted) return
+            const now = Date.now()
+            if (now - lastModelWarnAt.current < 10 * 60 * 1000) return
+            lastModelWarnAt.current = now
+            toast.error('整文のモデルの更新が必要です', {
+              description:
+                '接続先で使えるモデルが見つからず、整える前の文をそのまま貼りました。設定の「整文・字幕翻訳・議事録整形の接続先」で、モデル名に接続先で使えるモデルを入れてください。',
+              duration: 20000,
+              action: { label: '設定を開く', onClick: () => setPage('settings') },
+            })
+          }),
+        )
+      } catch (e) {
+        console.warn('[app] llm-model-unavailable listen failed:', e)
       }
     })()
     return () => {

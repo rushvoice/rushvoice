@@ -40,6 +40,10 @@ pub const CUSTOM_TRANSCRIBE_DEFAULT_MODEL: &str = "whisper-1";
 pub const GROQ_CHAT_MODEL: &str = "openai/gpt-oss-120b";
 /// Groq の日次枠が尽きたときの退避先 (小型)
 pub const GROQ_CHAT_FALLBACK_MODEL: &str = "openai/gpt-oss-20b";
+/// 整文・翻訳のモデル候補 (前から順に試す)。提供元がモデルを廃止・上限に達したら次の候補で続ける
+/// (2026-11-16 会長要望「複数用意しておく」)。使えない候補は接続先の /models で飛ばす。
+pub const GROQ_CHAT_MODELS: &[&str] = &[GROQ_CHAT_MODEL, "qwen/qwen3.8-27b", GROQ_CHAT_FALLBACK_MODEL];
+pub const OPENAI_CHAT_MODELS: &[&str] = &[OPENAI_CHAT_MODEL, "gpt-4.1-mini"];
 /// OpenAI の整文モデル
 pub const OPENAI_CHAT_MODEL: &str = "gpt-4o-mini";
 
@@ -77,13 +81,165 @@ pub fn with_reasoning_headroom(model: &str, max_tokens: u32) -> u32 {
     }
 }
 
-/// Groq / OpenAI のモデル名を設定で上書きする (カスタムは元からモデル名を持つので触らない)。
+/// Groq / OpenAI のモデル候補を設定で上書きする (カンマ区切りで複数可・前から順に試す)。
+/// カスタムは元からモデル名を持つので触らない。空なら既定の候補のまま。
 pub fn apply_model_override(mut ep: ChatEndpoint, model_override: &str) -> ChatEndpoint {
-    let m = model_override.trim();
-    if ep.label != "custom" && !m.is_empty() {
-        ep.model = m.to_string();
+    let list = parse_model_list(model_override);
+    if ep.label != "custom" && !list.is_empty() {
+        ep.model = list[0].clone();
+        ep.candidates = list;
     }
     ep
+}
+
+/// "a, b、c" や改行区切りのモデル名を、重複を除いて順に並べる。
+pub fn parse_model_list(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in s.split([',', '\n', '、']) {
+        let m = m.trim();
+        if !m.is_empty() && !out.iter().any(|x| x == m) {
+            out.push(m.to_string());
+        }
+    }
+    out
+}
+
+/// 「そのモデルが無い・廃止された」応答か。Groq は 404 model_not_found / 400 model_decommissioned、
+/// OpenAI は 404 model_not_found、Ollama は 404 「model "x" not found」を返す (2026-11-16 Groq で実測)。
+pub fn is_model_unavailable(status: u16, body: &str) -> bool {
+    if status != 404 && status != 400 {
+        return false;
+    }
+    let b = body.to_ascii_lowercase();
+    b.contains("model_not_found")
+        || b.contains("decommissioned")
+        || (b.contains("model")
+            && (b.contains("does not exist") || b.contains("not found") || b.contains("no longer supported")))
+}
+
+// ----- モデル候補の絞り込み (接続先の /models と、実際に「無い」と返されたモデル) -----
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// /models の結果を使い回す時間。モデルの入れ替えは日単位なので数時間で十分。
+const MODEL_LIST_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+#[derive(Default)]
+struct ModelState {
+    /// 接続先 URL → (取得時刻, 使えるモデル名)
+    listed: HashMap<String, (Instant, HashSet<String>)>,
+    /// (接続先 URL, モデル名): このアプリの起動中に「無い」と返されたもの
+    dead: HashSet<(String, String)>,
+}
+
+fn model_state() -> &'static Mutex<ModelState> {
+    static S: OnceLock<Mutex<ModelState>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(ModelState::default()))
+}
+
+/// 候補をすべて試しても「モデルが無い」で終わったか (画面に「モデルの更新が必要」と出すため)。
+static MODEL_UPDATE_NEEDED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_model_update_needed(v: bool) {
+    MODEL_UPDATE_NEEDED.store(v, Ordering::Relaxed);
+}
+
+/// 立っていれば下ろして true を返す (1 回の失敗で 1 回だけ知らせる)。
+pub fn take_model_update_needed() -> bool {
+    MODEL_UPDATE_NEEDED.swap(false, Ordering::Relaxed)
+}
+
+pub fn mark_model_unavailable(ep: &ChatEndpoint, model: &str) {
+    if let Ok(mut s) = model_state().lock() {
+        s.dead.insert((ep.url.clone(), model.to_string()));
+    }
+}
+
+/// 使う候補を決める (純粋関数)。
+/// - 「無い」と返された候補は外す。全部外れたら全部をもう一度試す (提供元が戻した場合に備える)
+/// - /models の一覧があれば、載っている候補だけにする。一つも載っていなければ絞らない
+///   (一覧が不完全な接続先があるため。外れたら送ったときの 404 で次へ進む)
+pub fn filter_candidates(
+    candidates: &[String],
+    listed: Option<&HashSet<String>>,
+    is_dead: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let alive: Vec<String> = candidates.iter().filter(|m| !is_dead(m)).cloned().collect();
+    let base = if alive.is_empty() { candidates.to_vec() } else { alive };
+    match listed {
+        Some(set) if !set.is_empty() => {
+            let f: Vec<String> = base.iter().filter(|m| set.contains(m.as_str())).cloned().collect();
+            if f.is_empty() {
+                base
+            } else {
+                f
+            }
+        }
+        _ => base,
+    }
+}
+
+async fn fetch_model_ids(client: &reqwest::Client, ep: &ChatEndpoint) -> Option<HashSet<String>> {
+    let base = ep.url.strip_suffix(CHAT_COMPLETIONS_PATH)?;
+    let url = format!("{}{}", base, MODELS_PATH);
+    let r = with_auth(client.get(&url), &ep.api_key)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    if !r.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = r.json().await.ok()?;
+    Some(
+        v.get("data")?
+            .as_array()?
+            .iter()
+            .filter_map(|m| m.get("id")?.as_str().map(String::from))
+            .collect(),
+    )
+}
+
+/// 今回送るモデル候補 (前から順に試す)。必ず 1 件以上返す。
+pub async fn usable_candidates(client: &reqwest::Client, ep: &ChatEndpoint) -> Vec<String> {
+    let candidates = if ep.candidates.is_empty() {
+        vec![ep.model.clone()]
+    } else {
+        ep.candidates.clone()
+    };
+    if candidates.len() <= 1 {
+        return candidates;
+    }
+    let cached = model_state().lock().ok().and_then(|s| {
+        s.listed
+            .get(&ep.url)
+            .filter(|(t, _)| t.elapsed() < MODEL_LIST_TTL)
+            .map(|(_, set)| set.clone())
+    });
+    let listed = match cached {
+        Some(set) => Some(set),
+        None => {
+            let fetched = fetch_model_ids(client, ep).await;
+            if let (Some(set), Ok(mut s)) = (&fetched, model_state().lock()) {
+                s.listed.insert(ep.url.clone(), (Instant::now(), set.clone()));
+            }
+            fetched
+        }
+    };
+    let dead: HashSet<String> = model_state()
+        .lock()
+        .map(|s| {
+            s.dead
+                .iter()
+                .filter(|(u, _)| u == &ep.url)
+                .map(|(_, m)| m.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    filter_candidates(&candidates, listed.as_ref(), &|m| dead.contains(m))
 }
 
 /// カスタム接続先の設定 (URL・モデル名)。キーは SecretsBundle 側。
@@ -346,8 +502,8 @@ pub struct ChatEndpoint {
     /// 空ならキーなし
     pub api_key: String,
     pub model: String,
-    /// 429 で待っても戻らない (日次枠の枯渇) ときに切り替えるモデル。Groq だけ。
-    pub fallback_model: Option<String>,
+    /// 前から順に試すモデル (先頭 = model)。日次上限・モデル廃止のときに次へ進む。
+    pub candidates: Vec<String>,
 }
 
 /// 整文・翻訳の接続先を決める (純粋関数)。
@@ -363,7 +519,7 @@ pub fn resolve_chat_endpoint(
                 url: endpoint_url(GROQ_BASE_URL, CHAT_COMPLETIONS_PATH),
                 api_key: k,
                 model: GROQ_CHAT_MODEL.into(),
-                fallback_model: Some(GROQ_CHAT_FALLBACK_MODEL.into()),
+                candidates: GROQ_CHAT_MODELS.iter().map(|m| m.to_string()).collect(),
             })
             .ok_or_else(|| "整文の接続先 (Groq) の API キーが未設定です".into()),
         LlmProvider::Openai => non_empty(&keys.openai_api_key)
@@ -372,7 +528,7 @@ pub fn resolve_chat_endpoint(
                 url: endpoint_url(OPENAI_BASE_URL, CHAT_COMPLETIONS_PATH),
                 api_key: k,
                 model: OPENAI_CHAT_MODEL.into(),
-                fallback_model: None,
+                candidates: OPENAI_CHAT_MODELS.iter().map(|m| m.to_string()).collect(),
             })
             .ok_or_else(|| "整文の接続先 (OpenAI) の API キーが未設定です".into()),
         LlmProvider::Custom => {
@@ -387,8 +543,8 @@ pub fn resolve_chat_endpoint(
                 label: "custom",
                 url: endpoint_url(&custom.base_url, CHAT_COMPLETIONS_PATH),
                 api_key: key,
-                model: model.into(),
-                fallback_model: None,
+                model: parse_model_list(model)[0].clone(),
+                candidates: parse_model_list(model),
             })
         }
     }
@@ -727,15 +883,21 @@ mod tests {
     fn chat_endpoint_per_provider() {
         let g = resolve_chat_endpoint(LlmProvider::Groq, &keys(Some("g"), None), &Default::default()).unwrap();
         assert_eq!(g.url, "https://api.groq.com/openai/v1/chat/completions");
-        assert_eq!(g.fallback_model.as_deref(), Some(GROQ_CHAT_FALLBACK_MODEL));
+        assert_eq!(g.candidates.first().map(String::as_str), Some(GROQ_CHAT_MODEL));
+        assert!(g.candidates.len() >= 2, "Groq は複数の候補を持つ");
 
         // モデル名の上書き: Groq / OpenAI は効き、空なら既定のまま
         let over = apply_model_override(g.clone(), " qwen/qwen3.8-27b ");
         assert_eq!(over.model, "qwen/qwen3.8-27b");
+        assert_eq!(over.candidates, vec!["qwen/qwen3.8-27b"]);
         assert_eq!(apply_model_override(g.clone(), "  ").model, GROQ_CHAT_MODEL);
         let o = resolve_chat_endpoint(LlmProvider::Openai, &keys(None, Some("o")), &Default::default()).unwrap();
         assert_eq!(o.model, OPENAI_CHAT_MODEL);
-        assert!(o.fallback_model.is_none());
+        assert_eq!(o.candidates.first().map(String::as_str), Some(OPENAI_CHAT_MODEL));
+        // 複数指定: 前から順に試す
+        let multi = apply_model_override(g.clone(), "a-model, b-model、a-model\nc-model");
+        assert_eq!(multi.model, "a-model");
+        assert_eq!(multi.candidates, vec!["a-model", "b-model", "c-model"]);
 
         assert!(resolve_chat_endpoint(LlmProvider::Groq, &keys(None, Some("o")), &Default::default()).is_err());
     }
@@ -796,5 +958,41 @@ mod tests {
         // 既定のモデルが廃止済みの llama に戻っていないこと
         assert!(!GROQ_CHAT_MODEL.contains("llama"));
         assert!(!GROQ_CHAT_FALLBACK_MODEL.contains("llama"));
+    }
+
+    #[test]
+    fn model_unavailable_detection() {
+        // 2026-11-16 Groq の実際の応答
+        let groq = r#"{"error":{"message":"The model `llama-3.3-70b-versatile` does not exist or you do not have access to it.","type":"invalid_request_error","code":"model_not_found"}}"#;
+        assert!(is_model_unavailable(404, groq));
+        assert!(is_model_unavailable(400, r#"{"error":{"code":"model_decommissioned"}}"#));
+        assert!(is_model_unavailable(404, r#"{"error":{"message":"model \"qwen2.5:7b\" not found, try pulling it first"}}"#));
+        assert!(!is_model_unavailable(401, groq), "鍵の誤りは別扱い");
+        assert!(!is_model_unavailable(400, r#"{"error":{"message":"response_format is not supported"}}"#));
+        assert!(!is_model_unavailable(500, "model overloaded"));
+    }
+
+    #[test]
+    fn candidates_are_filtered_by_list_and_dead_set() {
+        let c: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let none = |_: &str| false;
+        // 一覧なし → そのまま
+        assert_eq!(filter_candidates(&c, None, &none), c);
+        // 一覧にあるものだけ (順序は候補の順)
+        let listed: HashSet<String> = ["c", "a", "zzz"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(filter_candidates(&c, Some(&listed), &none), vec!["a", "c"]);
+        // 一覧に一つも無ければ絞らない
+        let other: HashSet<String> = ["x"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(filter_candidates(&c, Some(&other), &none), c);
+        // 「無い」と返されたものは外す。全部外れたら全部をもう一度
+        assert_eq!(filter_candidates(&c, None, &|m| m == "a"), vec!["b", "c"]);
+        assert_eq!(filter_candidates(&c, None, &|_| true), c);
+    }
+
+    #[test]
+    fn model_update_flag_is_taken_once() {
+        set_model_update_needed(true);
+        assert!(take_model_update_needed());
+        assert!(!take_model_update_needed());
     }
 }
