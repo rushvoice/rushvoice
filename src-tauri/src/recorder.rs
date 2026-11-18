@@ -1429,9 +1429,23 @@ async fn transcribe_collected(
             send_len * 1000 / 16_000
         );
     }
-    let send_samples = &mono16k[..send_len];
     // 2026-11-15: 設定で入れたときだけ、直近の録音を PC の中に残す (原因調べ用・recent_audio.rs)
     crate::recent_audio::save_if_enabled(&mono16k, send_len);
+    // 2026-11-18: 先頭・途中の長い無音も詰めてから送る (speech_gate.rs・history id=8458)。
+    // 4 分の録音の 95% が無音・雑音で、増幅された雑音から Whisper が文を作っていた。
+    let compacted = crate::speech_gate::compact_silences(&mono16k[..send_len], 16_000);
+    if let Some(c) = &compacted {
+        log::info!(
+            "[recorder] silences compacted for ASR: kept {}ms removed {}ms speech_ratio={:.2}",
+            c.kept_ms,
+            c.removed_ms,
+            c.speech_ratio
+        );
+    }
+    let send_samples: &[f32] = match &compacted {
+        Some(c) => &c.samples,
+        None => &mono16k[..send_len],
+    };
     let wav = match boost_for_asr(send_samples) {
         Some((boosted, gain)) => {
             log::info!("[recorder] input level boosted for ASR: gain={:.1}x", gain);
@@ -1692,12 +1706,29 @@ async fn transcribe_collected(
                 input_peak,
             );
             let whole_text_case = should_suppress_paste_for_whole_text_hallucination(&reason);
-            let suppress_paste = silence_case || whole_text_case;
+            // 2026-11-18: 既知句が混ざった本文は、句だけを外して貼る (history id=8458)。
+            // 外したら何も残らない = 本文全体が幻の句なので貼らない。
+            let original_text = text.clone();
+            let (text, phrases_stripped) = if matches!(reason, HaluReason::KnownSubstring { .. }) {
+                crate::tail_guard::strip_known_phrases(&text, KNOWN_HALLUCINATION_SUBSTRINGS)
+            } else {
+                (text.clone(), 0)
+            };
+            let nothing_left_case =
+                phrases_stripped > 0 && crate::halu::normalize(&text).is_empty();
+            if phrases_stripped > 0 {
+                log::warn!(
+                    "[recorder] stripped {} known hallucination phrase(s); remaining text_len={}",
+                    phrases_stripped,
+                    text.chars().count()
+                );
+            }
+            let suppress_paste = silence_case || whole_text_case || nothing_left_case;
             log::warn!(
                 "[recorder] halu drop: {} (2026-08-02 既定方針) reason={} text_len={} peak={}",
                 if silence_case {
                     "suppressing paste (silence)"
-                } else if whole_text_case {
+                } else if whole_text_case || nothing_left_case {
                     "suppressing paste (whole text is a known hallucination)"
                 } else {
                     "pasting anyway"
@@ -1723,7 +1754,12 @@ async fn transcribe_collected(
                 } else {
                     display_text.clone()
                 },
-                raw_text_for_history: display_text,
+                // 全部外れたときは元の本文を履歴に残す (手動で確かめられるように)
+                raw_text_for_history: if display_text.is_empty() {
+                    add_trailing_punctuation(&original_text)
+                } else {
+                    display_text
+                },
                 provider: used_provider.clone(),
                 model: model_name,
                 duration_ms,
@@ -3577,6 +3613,27 @@ mod tests {
 
     fn is_drop(v: &crate::halu::HaluVerdict) -> bool {
         matches!(v, crate::halu::HaluVerdict::Drop(_))
+    }
+
+    /// id=8458 (247.7 秒・声は約 5%)。無音を詰めて送り直した Groq の実際の返り値
+    /// 「えっと、ご視聴ありがとうございました。」が、本番の判定で既知句として捕まり、
+    /// 句を外すと「えっと」だけが残ることを固定する (2026-11-18)。
+    #[test]
+    fn known_phrase_is_stripped_not_pasted_id8458() {
+        let text = "えっと、ご視聴ありがとうございました。";
+        let v = production_halu_filter().judge_with_duration(
+            text,
+            &audible_samples(),
+            Some(0.0),
+            Some(-0.47),
+            Some(247_700),
+        );
+        assert!(matches!(
+            v,
+            crate::halu::HaluVerdict::Drop(crate::halu::HaluReason::KnownSubstring { .. })
+        ));
+        let (out, n) = crate::tail_guard::strip_known_phrases(text, KNOWN_HALLUCINATION_SUBSTRINGS);
+        assert_eq!((out.as_str(), n), ("えっと", 1));
     }
 
     /// id=348 (15.7 秒の発話 → 「字幕作成者 。」・avg_logprob -1.33)。

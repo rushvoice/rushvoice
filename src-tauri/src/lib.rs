@@ -27,6 +27,7 @@ pub mod profile_db;
 pub mod prompt_sanitize;
 pub mod recent_audio;
 pub mod recorder;
+pub mod speech_gate;
 pub mod tail_guard;
 pub mod resampler;
 pub mod subtitle;
