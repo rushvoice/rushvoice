@@ -4,9 +4,10 @@
 AI に頼むときは「`https://github.com/rushvoice/rushvoice/blob/main/INSTALL.md` を読んで、この PC に RushVoice を入れて」と伝えてください。
 
 - 対応 OS: Windows 10 / 11（x64）、macOS 13 以降（Apple Silicon・Intel）
-- 必要なもの: マイク、インターネット接続、次のどちらか
-  - [Groq](https://console.groq.com/keys) の API キー（無料枠あり。料金は自分の Groq アカウントにかかる）
-  - RushVoice アカウント（有料版。メールアドレスに届く確認コードでログイン）
+- 必要なもの: マイクと、次のどれか1つ（アカウント登録やログインはありません）
+  - [Groq](https://console.groq.com/keys) の API キー（無料枠あり。料金は自分の Groq アカウントにかかる・いちばん手軽）
+  - [OpenAI](https://platform.openai.com/) の API キー
+  - 手元のローカル LLM や社内サーバーなど、OpenAI 互換の接続先（書き方は README の「接続先」）
 
 ---
 
@@ -17,7 +18,7 @@ AI に頼むときは「`https://github.com/rushvoice/rushvoice/blob/main/INSTAL
 1. [Releases の最新版](https://github.com/rushvoice/rushvoice/releases/latest) から `RushVoice_<版>_x64-setup.exe` をダウンロードする。
 2. ダブルクリックで開く。コード署名をしていないため「Windows によって PC が保護されました」と出たら、**このリポジトリの Releases から入手したファイルであることを確かめてから**「詳細情報」→「実行」を選ぶ。
 3. インストールが終わると RushVoice が起動する。
-4. 「設定」→「API キー」に Groq の API キーを貼り付けて保存する（RushVoice アカウントで使うときは、設定画面からログインする）。
+4. 「設定」→「接続先と API キー」で接続先（初めてなら Groq）を選び、API キーを貼り付けて保存する。「接続テスト」でつながるか確かめられる。
 5. メモ帳などを開き、ホットキー **Ctrl + Shift + 無変換** を押して話し、もう一度押すと、カーソル位置に文字が入る。ホットキーは「設定」で変えられる。
 
 ### macOS
@@ -31,14 +32,14 @@ AI に頼むときは「`https://github.com/rushvoice/rushvoice/blob/main/INSTAL
    - **マイク**
    - **アクセシビリティ**（ホットキーと貼り付けに使う）。「システム設定」→「プライバシーとセキュリティ」→「アクセシビリティ」で RushVoice をオンにし、RushVoice を一度終了して開き直す
 5. 「設定」でホットキーを決める（Mac のキーボードには「無変換」が無いため）。
-6. 「設定」→「API キー」に Groq の API キーを貼り付けて保存する（RushVoice アカウントで使うときは、設定画面からログインする）。
+6. 「設定」→「接続先と API キー」で接続先（初めてなら Groq）を選び、API キーを貼り付けて保存する。「接続テスト」でつながるか確かめられる。
 7. メモなどを開き、ホットキーを押して話し、もう一度押すと、カーソル位置に文字が入る。
 
 ### うまく動かないとき
 
 | 症状 | 確かめること |
 |---|---|
-| 文字が入らない | 設定の API キーが保存されているか。Mac はアクセシビリティの許可と、許可後の再起動 |
+| 文字が入らない | 「接続先と API キー」が保存され、「接続テスト」が通るか。Mac はアクセシビリティの許可と、許可後の再起動 |
 | 録音されない・無音になる | OS のマイクの許可。使うマイクを「設定」で選ぶ |
 | ホットキーが反応しない | 他のアプリと同じキーになっていないか。「設定」で別のキーにする |
 
@@ -123,7 +124,7 @@ The app is not notarized by Apple, so macOS will block the first launch. **[user
 
 ### Step 3: Things only the user can do — explain them and wait
 - **[user]** macOS: allow **Microphone** and **Accessibility** for RushVoice (System Settings → Privacy & Security), then quit and reopen RushVoice.
-- **[user]** Open RushVoice → 設定 (Settings) → API キー, paste a Groq API key from https://console.groq.com/keys and save. Or sign in to a RushVoice account from Settings.
+- **[user]** Open RushVoice → 設定 (Settings) → 接続先と API キー (Connection and API key). Choose Groq (simplest; key from https://console.groq.com/keys), OpenAI, or a custom OpenAI-compatible endpoint such as a local LLM, enter the key, save, and press 接続テスト (Test connection). There is no account or sign-in.
 - **[user]** macOS: choose a hotkey in 設定 (the default Windows key 無変換 does not exist on Mac keyboards).
 
 ### Step 4: Verify
@@ -146,4 +147,4 @@ cd ../src-tauri
 cargo tauri dev
 ```
 
-インストーラーを作るときは、最後の行を `cargo tauri build` にします。自分でビルドした版は RushVoice アカウントのログインが無効で、自分の API キーで動きます。
+インストーラーを作るときは、最後の行を `cargo tauri build` にします。公式版と同じく、自分の API キーかローカル LLM などの接続先で動きます。
