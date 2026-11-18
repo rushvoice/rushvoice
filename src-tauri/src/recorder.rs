@@ -1034,6 +1034,10 @@ pub fn start_session(
         let mut rms_peak: f32 = 0.0;
         let mut rms_min: f32 = f32::MAX;
         let mut rms_count: u64 = 0;
+        // 2026-11-18: 押し間違いで録音しっぱなしになったら自動で止める (speech_gate.rs・id=8458)
+        let (fmt_rate, fmt_ch) = info;
+        let mut idle_meter = crate::speech_gate::OnlineSpeechMeter::default();
+        let mut auto_stop_requested = false;
         // 語尾パディング (2026-07-23): stop 指示を検知したら即 break せず、
         // STOP_TAIL_PADDING_MS 分だけ録音を延長してから確定する (語尾切れ対策)。
         let mut stop_deadline: Option<std::time::Instant> = None;
@@ -1096,6 +1100,23 @@ pub fn start_session(
                         // 現フレームの loud 観測は emit 判定後に反映 (次回判定で抑止)
                         if rms >= mic_low_level.threshold {
                             seen_loud = true;
+                        }
+                    }
+                    // 2026-11-18: 直近 30 秒ほぼ声が無ければ、ホットキーで止めたのと同じ処理を呼ぶ
+                    let frame_ms = (frame.samples.len() as u64 * 1000
+                        / (fmt_rate.max(1) as u64 * fmt_ch.max(1) as u64))
+                        as u32;
+                    idle_meter.push(rms, frame_ms);
+                    if !auto_stop_requested && stop_deadline.is_none() && idle_meter.is_idle() {
+                        auto_stop_requested = true;
+                        log::warn!(
+                            "[recorder] no voice for {}s (recent speech ratio {:?}); requesting auto stop",
+                            crate::speech_gate::IDLE_WINDOW_MS / 1000,
+                            idle_meter.recent_ratio()
+                        );
+                        if let Some(ref app_h) = app_for_thread {
+                            let _ = app_h.emit("recorder:auto-stopped", ());
+                            crate::request_auto_stop(app_h.clone());
                         }
                     }
                     if let Ok(mut buf) = frames_ref.lock() {
@@ -1414,6 +1435,18 @@ async fn transcribe_collected(
 
     if mono16k.is_empty() {
         return Err("リサンプル後のサンプルが空です".into());
+    }
+
+    // 2026-11-18: 声がほとんど無い録音 (押し間違い) は文字にせず捨てる (speech_gate.rs・id=8458)。
+    // 送ると雑音から幻の文ができ、「えっと」だけ等が貼られる。
+    let ratio = crate::speech_gate::speech_ratio(&mono16k, 16_000);
+    if crate::speech_gate::should_discard_as_no_speech(ratio, duration_ms) {
+        log::warn!(
+            "[recorder] discarded: almost no voice (speech ratio {:?}, {}ms)",
+            ratio,
+            duration_ms
+        );
+        return Err("声がほとんど入っていなかったので、文字にせず捨てました".into());
     }
 
     // ASR へ送る音声だけレベルを持ち上げる。mono16k (増幅前) はこの後の

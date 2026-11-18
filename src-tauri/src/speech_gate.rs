@@ -125,6 +125,128 @@ pub fn compact_silences(samples: &[f32], sample_rate: usize) -> Option<Compacted
     })
 }
 
+/// 声の割合 (0.0〜1.0)。録音全体から雑音の床を決めて数える (`compact_silences` と同じ物差し)。
+/// 短すぎて判断できないときは `None`。
+pub fn speech_ratio(samples: &[f32], sample_rate: usize) -> Option<f32> {
+    speech_regions(samples, sample_rate).map(|(_, r)| r)
+}
+
+// ---------------------------------------------------------------------------
+// 押し間違いの録音を見分ける (2026-11-18)
+//
+// 実例 id=8458: 録音を間違えて始めたまま 4 分話さず、雑音から幻の文が貼られた。
+// 開発者の PC の直近 20 件の実録音 (2026-11-18) での声の割合:
+//   普段の録音   : 全体 0.40〜0.63 / 録音中に測った直近 30 秒の最小 0.37
+//   id=8458     : 全体 0.03〜0.05
+// 余裕を見て 0.10 で切る。
+// ---------------------------------------------------------------------------
+
+/// 録音中、直近この長さの声の割合を見る (ms)
+pub const IDLE_WINDOW_MS: u64 = 30_000;
+/// 直近 `IDLE_WINDOW_MS` の声の割合がこれ未満なら、録音を自動で止める
+pub const IDLE_SPEECH_RATIO_MAX: f32 = 0.10;
+/// 録音全体の声の割合がこれ未満なら、文字にせず捨てる
+pub const DISCARD_SPEECH_RATIO_MAX: f32 = 0.10;
+/// これより短い録音は捨てない (短い一言は割合がぶれるため・ms)
+pub const DISCARD_MIN_DURATION_MS: i64 = 5_000;
+
+/// 押し間違いとみなして捨てるか。
+pub fn should_discard_as_no_speech(speech_ratio: Option<f32>, duration_ms: i64) -> bool {
+    duration_ms >= DISCARD_MIN_DURATION_MS
+        && speech_ratio.is_some_and(|r| r < DISCARD_SPEECH_RATIO_MAX)
+}
+
+/// 雑音の床を録音中に見積もるための、音量 (RMS) の分布の刻み。1e-5〜1 を 1 桁 24 刻み。
+const HIST_BINS: usize = 120;
+const HIST_PER_DECADE: f32 = 24.0;
+
+/// 録音中に、直近 `IDLE_WINDOW_MS` の声の割合を数える。
+/// 雑音の床は「これまでのフレームの下位 10%」(録音後の判定と同じ物差し) を分布から求める。
+#[derive(Debug)]
+pub struct OnlineSpeechMeter {
+    hist: [u32; HIST_BINS],
+    count: u32,
+    run_ms: u32,
+    /// (フレームの長さ ms, 声か)
+    window: std::collections::VecDeque<(u32, bool)>,
+    window_ms: u64,
+    speech_ms: u64,
+    elapsed_ms: u64,
+}
+
+impl Default for OnlineSpeechMeter {
+    fn default() -> Self {
+        Self {
+            hist: [0; HIST_BINS],
+            count: 0,
+            run_ms: 0,
+            window: std::collections::VecDeque::new(),
+            window_ms: 0,
+            speech_ms: 0,
+            elapsed_ms: 0,
+        }
+    }
+}
+
+impl OnlineSpeechMeter {
+    fn bin_of(rms: f32) -> usize {
+        let b = ((rms.max(1e-5).log10() + 5.0) * HIST_PER_DECADE) as isize;
+        b.clamp(0, HIST_BINS as isize - 1) as usize
+    }
+
+    fn floor(&self) -> f32 {
+        let target = (self.count as f32 * 0.1).ceil() as u32;
+        let mut acc = 0u32;
+        for (b, n) in self.hist.iter().enumerate() {
+            acc += n;
+            if acc >= target.max(1) {
+                return 10f32.powf((b as f32 + 1.0) / HIST_PER_DECADE - 5.0);
+            }
+        }
+        1.0
+    }
+
+    /// 1 フレーム (長さ `frame_ms`・音量 `rms`) を足す。
+    pub fn push(&mut self, rms: f32, frame_ms: u32) {
+        if frame_ms == 0 {
+            return;
+        }
+        self.hist[Self::bin_of(rms)] += 1;
+        self.count += 1;
+        let threshold = (self.floor() * SPEECH_OVER_FLOOR).max(1e-3);
+        // 90ms 以上続いた分だけを声とみなす (単発のクリック音を数えない)
+        self.run_ms = if rms > threshold { self.run_ms + frame_ms } else { 0 };
+        let min_run_ms = (MIN_SPEECH_RUN_FRAMES * FRAME_MS) as u32;
+        let is_speech = self.run_ms >= min_run_ms;
+        self.window.push_back((frame_ms, is_speech));
+        self.window_ms += frame_ms as u64;
+        if is_speech {
+            self.speech_ms += frame_ms as u64;
+        }
+        self.elapsed_ms += frame_ms as u64;
+        while self.window_ms > IDLE_WINDOW_MS {
+            let Some((ms, sp)) = self.window.pop_front() else { break };
+            self.window_ms -= ms as u64;
+            if sp {
+                self.speech_ms -= ms as u64;
+            }
+        }
+    }
+
+    /// 直近 `IDLE_WINDOW_MS` の声の割合。まだその長さに届いていなければ `None`。
+    pub fn recent_ratio(&self) -> Option<f32> {
+        if self.elapsed_ms < IDLE_WINDOW_MS || self.window_ms == 0 {
+            return None;
+        }
+        Some(self.speech_ms as f32 / self.window_ms as f32)
+    }
+
+    /// 声の無い状態が続いていて、録音を自動で止めるべきか。
+    pub fn is_idle(&self) -> bool {
+        self.recent_ratio().is_some_and(|r| r < IDLE_SPEECH_RATIO_MAX)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +308,54 @@ mod tests {
     #[test]
     fn all_silence_returns_none() {
         assert_eq!(compact_silences(&noise(30_000, 0.002), SR), None);
+    }
+
+    /// 30ms ごとの RMS 列を meter に流す
+    fn feed(m: &mut OnlineSpeechMeter, samples: &[f32]) {
+        for c in samples.chunks(SR * 30 / 1000) {
+            let rms = (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32).sqrt();
+            m.push(rms, 30);
+        }
+    }
+
+    #[test]
+    fn meter_stops_after_30s_without_voice() {
+        let mut m = OnlineSpeechMeter::default();
+        // 最初に 5 秒話し、その後 29 秒は雑音だけ → まだ止めない (直近 30 秒に 1 秒の声)
+        feed(&mut m, &tone(5_000, 0.1));
+        feed(&mut m, &noise(24_000, 0.002));
+        assert!(!m.is_idle());
+        // さらに 10 秒雑音 → 直近 30 秒は雑音だけ → 止める
+        feed(&mut m, &noise(10_000, 0.002));
+        assert!(m.is_idle(), "ratio {:?}", m.recent_ratio());
+    }
+
+    #[test]
+    fn meter_does_not_stop_normal_speech() {
+        let mut m = OnlineSpeechMeter::default();
+        // 声 3 秒と間 1.5 秒の繰り返しを 60 秒
+        for _ in 0..14 {
+            feed(&mut m, &tone(3_000, 0.1));
+            feed(&mut m, &noise(1_500, 0.002));
+        }
+        assert!(!m.is_idle(), "ratio {:?}", m.recent_ratio());
+        assert!(m.recent_ratio().unwrap() > 0.5);
+    }
+
+    #[test]
+    fn meter_waits_for_full_window() {
+        let mut m = OnlineSpeechMeter::default();
+        feed(&mut m, &noise(20_000, 0.002));
+        assert_eq!(m.recent_ratio(), None);
+        assert!(!m.is_idle());
+    }
+
+    #[test]
+    fn discard_rule() {
+        assert!(should_discard_as_no_speech(Some(0.04), 247_700)); // id=8458
+        assert!(!should_discard_as_no_speech(Some(0.40), 10_600)); // 普段の最小
+        assert!(!should_discard_as_no_speech(Some(0.02), 3_000)); // 短い一言は捨てない
+        assert!(!should_discard_as_no_speech(None, 60_000)); // 判断できない
     }
 
     #[test]
