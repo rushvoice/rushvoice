@@ -41,6 +41,10 @@ import {
 } from '../lib/tauri'
 import { GatewayRetiredNotice } from '../components/GatewayRetiredNotice'
 import { cn } from '../lib/cn'
+import { IS_MAC, localizeKeyLabel } from '../lib/platform'
+
+// 画面に出す OS 名（Mac で「Windows」と出ないように・利用者の報告 11-16）
+const OS_NAME = IS_MAC ? 'Mac' : 'Windows'
 
 export function SettingsPage() {
   return (
@@ -208,7 +212,7 @@ function formatHotkey(c: HotkeyConfig): string {
   const key =
     KEY_LABEL_JA[c.code] ??
     c.code.replace(/^Key/, '').replace(/^Digit/, '').replace(/^Arrow/, '')
-  return [...mods, key].join(' + ')
+  return localizeKeyLabel([...mods, key].join(' + '))
 }
 
 type Side = 'Left' | 'Right'
@@ -305,59 +309,79 @@ function HotkeySection() {
     }
   }, [capturing])
 
+  // 2026-11-17 Mac 利用者「2〜3個を同時に押しても最初の1個しか入らない」:
+  // 修飾キーの状態を e.ctrlKey 等のフラグに頼らず、押されたキーを自分で数える。
+  // 全部のキーを離した時点で、修飾キーだけの組合せ (例 Ctrl+Option) も確定できるようにする。
+  //   downRef      … いま押されているキー (e.code)
+  //   modOrderRef  … このキャプチャ中に押された修飾キー (総称名・押した順)
+  const downRef = useRef<Set<string>>(new Set())
+  const modOrderRef = useRef<string[]>([])
+
+  function resetCaptureRefs() {
+    heldModsRef.current = {}
+    downRef.current = new Set()
+    modOrderRef.current = []
+  }
+
+  // capturing が切り替わるたびに数え直す
+  useEffect(() => {
+    resetCaptureRefs()
+  }, [capturing])
+
+  function genericModName(kind: keyof HeldMods): string {
+    return kind.charAt(0).toUpperCase() + kind.slice(1)
+  }
+
   function handleKeyCapture(e: ReactKeyboardEvent<HTMLDivElement>) {
     if (!capturing || !draft) return
     e.preventDefault()
     e.stopPropagation()
+    if (e.repeat) return
+    downRef.current.add(e.code)
 
-    // 修飾キー単独押下: 左右を ref に保持してこのキーでは確定しない
+    // 修飾キー: 押した順に覚えておき、このキーでは確定しない
     const modInfo = parseModifierCode(e.code)
     if (modInfo) {
       heldModsRef.current[modInfo.kind] = modInfo.side
+      const name = genericModName(modInfo.kind)
+      if (!modOrderRef.current.includes(name)) modOrderRef.current.push(name)
       return
     }
 
     // メインキー押下: コンビネーション確定。
-    //
-    // mac/hotkey-cmd-either-side (2026-06-15):
-    // 修飾キー側もデフォルトで「左右どちらでも」(総称 'Control'/'Shift'/'Alt'/'Meta')
-    // を保存するよう変更。理由は handleKeyUp と同じ:
-    //   - マウスのカスタムボタン (Logi Options+ で "⌘Cmd + F12" 等) は左右指定不能
-    //   - 物理キーボードでも、左右をユーザーが意識して使い分けるケースは稀
-    //   - 厳格な左右指定が必要なら `ControlLeft` 等を手動で設定可 (API は維持)
-    const mods: string[] = []
-    if (e.ctrlKey) mods.push('Control')
-    if (e.shiftKey) mods.push('Shift')
-    if (e.altKey) mods.push('Alt')
-    if (e.metaKey) mods.push('Meta')
+    // 修飾キーは「左右どちらでも」の総称名で保存する (mac/hotkey-cmd-either-side 2026-06-15)。
+    // 自分で数えた修飾キーと、イベントのフラグの両方を合わせる (どちらかが欠けても拾う)。
+    const mods: string[] = [...modOrderRef.current]
+    const addFlag = (on: boolean, name: string) => {
+      if (on && !mods.includes(name)) mods.push(name)
+    }
+    addFlag(e.ctrlKey, 'Control')
+    addFlag(e.shiftKey, 'Shift')
+    addFlag(e.altKey, 'Alt')
+    addFlag(e.metaKey, 'Meta')
+    const order = ['Control', 'Shift', 'Alt', 'Meta']
+    mods.sort((x, y) => order.indexOf(x) - order.indexOf(y))
 
     setDraft({ code: e.code, modifiers: mods, mode: draft.mode })
     setCapturing(false)
-    heldModsRef.current = {} // 次回キャプチャ用に reset
+    resetCaptureRefs()
   }
 
-  // 要望 2026-05-21: 修飾キー単独 (右Ctrl 単体等) をホットキーとして使う
-  // → 修飾キーを離した瞬間に「他のキー一切押されていない」なら単独確定
-  //
-  // mac/hotkey-cmd-either-side (2026-06-15): デフォルトで「左右どちらでも反応」する
-  // 総称コード ('Meta', 'Control' 等) を保存する。理由:
-  //   - マウスのカスタムキー割当 (Logitech MX Master 等) は Cmd を送る際に左右を区別できず、
-  //     かつ macOS は受け取り側で左右を識別できない (CGEventFlagCommand は両方共通) ため、
-  //     左/右指定だと「片側だけ反応・片側だけ無反応」になる。
-  //   - 物理キーボードでホットキーを使うユーザーも、わざわざ「右だけ」「左だけ」と
-  //     使い分けるケースは稀。両側受け付ける方が UX として自然。
-  //   - 左/右厳格な指定が必要なら 'MetaLeft' / 'MetaRight' を手動で設定可 (現状の API は維持)。
+  // 修飾キーだけのホットキー (右Ctrl 単体・Ctrl+Option など):
+  // 全部のキーを離した時点で、押されていた修飾キーから確定する。
+  //   1個 → その修飾キー単独 / 2個以上 → 最後に押したものをメイン、残りを修飾キーにする
   function handleKeyUp(e: ReactKeyboardEvent<HTMLDivElement>) {
     if (!capturing || !draft) return
-    const modInfo = parseModifierCode(e.code)
-    if (!modInfo) return
-    // 他の修飾キーやメインキーが押されていなければ単独確定
-    if (e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) return
-    // kind: 'control' | 'shift' | 'alt' | 'meta' → 'Control' | 'Shift' | 'Alt' | 'Meta'
-    const code = modInfo.kind.charAt(0).toUpperCase() + modInfo.kind.slice(1)
-    setDraft({ code, modifiers: [], mode: draft.mode })
+    downRef.current.delete(e.code)
+    if (!parseModifierCode(e.code)) return
+    if (downRef.current.size > 0) return
+    const pressed = modOrderRef.current
+    if (pressed.length === 0) return
+    const code = pressed[pressed.length - 1]
+    const modifiers = pressed.slice(0, -1)
+    setDraft({ code, modifiers, mode: draft.mode })
     setCapturing(false)
-    heldModsRef.current = {}
+    resetCaptureRefs()
   }
 
   function handleModeChange(mode: HotkeyMode) {
@@ -537,7 +561,7 @@ function AutostartSection() {
     try {
       if (next) {
         await enableAutostart()
-        toast.success('Windows 起動時に自動起動するよう登録しました')
+        toast.success(`${OS_NAME} 起動時に自動起動するよう登録しました`)
       } else {
         await disableAutostart()
         toast.success('自動起動の登録を解除しました')
@@ -562,7 +586,7 @@ function AutostartSection() {
 
       <label className="flex items-center justify-between gap-3 cursor-pointer">
         <div>
-          <div className="text-sm text-neutral-100">Windows 起動時に自動起動</div>
+          <div className="text-sm text-neutral-100">{OS_NAME} 起動時に自動起動</div>
           <div className="text-xs text-neutral-500 mt-0.5">
             {enabled === null
               ? '読込中…'
@@ -851,7 +875,7 @@ function MicSection() {
       setSelected(value)
       // スタンバイ ON なら新デバイスで張り直す
       await applyMicStandby()
-      const label = value === '' ? 'Windows 既定デバイス' : value
+      const label = value === '' ? `${OS_NAME} 既定デバイス` : value
       toast.success(`マイクを「${label}」に変更しました（次の録音から反映）`)
     } catch (e) {
       toast.error(`マイク設定の保存に失敗しました: ${e}`)
@@ -902,7 +926,7 @@ function MicSection() {
         録音に使うマイク:{' '}
         <span className="text-emerald-400">
           {selected === ''
-            ? `${defaultName ?? '(不明)'} （Windows 既定）`
+            ? `${defaultName ?? '(不明)'} （${OS_NAME} 既定）`
             : missingSelected
               ? `${defaultName ?? '(不明)'} （選択中の「${selected}」が未接続のため既定を使用）`
               : selected}
@@ -921,7 +945,7 @@ function MicSection() {
           disabled={!loaded || busy}
         >
           <option value="">
-            Windows の設定に従う（自動）{defaultName ? ` — 現在: ${defaultName}` : ''}
+            {OS_NAME} の設定に従う（自動）{defaultName ? ` — 現在: ${defaultName}` : ''}
           </option>
           {devices.map((name) => (
             <option key={name} value={name}>
@@ -934,7 +958,7 @@ function MicSection() {
         </select>
         <p className="text-xs text-neutral-500 mt-1.5">
           ヘッドセット（Shokz など）に切り替えたい時はここで選ぶだけで OK。次の録音から反映されます。
-          選んだマイクが未接続の時は自動で Windows 既定マイクを使うので録音は止まりません。
+          選んだマイクが未接続の時は自動で {OS_NAME} 既定マイクを使うので録音は止まりません。
           接続したばかりの機器が出てこない時は「↻ 一覧を更新」を押してください。
         </p>
       </div>
@@ -959,6 +983,13 @@ function MicSection() {
               音声はどこにも保存・送信されません（接続維持のみ）。
               ヘッドセットの電池消費が少し増える点と、スタンバイ中は通話用モードになるため
               音楽再生の音質が下がる点にご注意ください。
+              {IS_MAC && (
+                <>
+                  <br />
+                  Mac では、ON の間はメニューバーのマイクの印（オレンジ）がずっと点いたままになります。
+                  気になるときは OFF にしてください（録音を始めた時だけマイクを使います）。
+                </>
+              )}
             </span>
           </span>
         </label>

@@ -449,24 +449,19 @@ pub fn run() {
             // Stage 2-C-2: KeyboardHook 起動 (WH_KEYBOARD_LL)
             let config = load_hotkey_config_or_default()
                 .unwrap_or_else(|_| HotkeyConfig::default());
-            let app_handle = app.handle().clone();
-            let callback: HotkeyCallback = Arc::new(move |event: HotkeyEvent| {
-                let app = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    handle_hotkey_event(app, event).await;
-                });
-            });
-            match KeyboardHook::start(config.clone(), callback) {
-                Ok(hook) => {
-                    if let Ok(mut guard) = hook_holder_for_setup.lock() {
-                        *guard = Some(hook);
-                    }
-                    log::info!(
-                        "[hotkey] WH_KEYBOARD_LL started: code={} modifiers={:?} mode={:?}",
-                        config.code, config.modifiers, config.mode
-                    );
+            match start_keyboard_hook(app.handle(), &hook_holder_for_setup, config.clone()) {
+                Ok(()) => log::info!(
+                    "[hotkey] WH_KEYBOARD_LL started: code={} modifiers={:?} mode={:?}",
+                    config.code, config.modifiers, config.mode
+                ),
+                Err(e) => {
+                    log::error!("[hotkey] KeyboardHook::start failed: {}", e);
+                    // 2026-11-18: Mac は許可 (アクセシビリティ) が入るまで起動を試し直す。
+                    // 許可を入れたあと、アプリを開き直さなくてもホットキーが効くように
+                    // (利用者の報告 11-17「入れ直して開き直しても効かない」)。
+                    #[cfg(target_os = "macos")]
+                    spawn_hook_retry_until_permitted(app.handle().clone());
                 }
-                Err(e) => log::error!("[hotkey] KeyboardHook::start failed: {}", e),
             }
 
             // mac/url-scheme-trigger (2026-06-16): URL Scheme ハンドラ登録
@@ -711,6 +706,56 @@ fn load_hotkey_config_or_default() -> Result<HotkeyConfig, String> {
 /// HK-06: HookHolder から KeyboardHook.set_recording を呼ぶヘルパー。
 /// is_recording フラグを全録音開始/停止箇所で一元管理する。
 /// ⚠️ false の呼び忘れ = Idle 時の ESC を吸い込む致命バグ → このヘルパー経由で確実に呼ぶ。
+/// KeyboardHook を起動して holder に入れる。
+///
+/// 起動時に加え、起動時に失敗していたとき (Mac でアクセシビリティ未許可のまま開いた・
+/// アプリを入れ替えて許可が古い版のままになった等) に、ホットキー保存の時点で
+/// もう一度起動し直すためにも使う (2026-11-17 Mac 利用者の「KeyboardHook not initialized」)。
+pub(crate) fn start_keyboard_hook(
+    app: &tauri::AppHandle,
+    holder: &HookHolder,
+    config: HotkeyConfig,
+) -> Result<(), String> {
+    let app_handle = app.clone();
+    let callback: HotkeyCallback = Arc::new(move |event: HotkeyEvent| {
+        let app = app_handle.clone();
+        tauri::async_runtime::spawn(async move {
+            handle_hotkey_event(app, event).await;
+        });
+    });
+    let hook = KeyboardHook::start(config, callback)?;
+    let mut guard = holder
+        .lock()
+        .map_err(|e| format!("hook lock poisoned: {}", e))?;
+    *guard = Some(hook);
+    Ok(())
+}
+
+/// ホットキーの起動に失敗したあと、3 秒ごとに試し直す (最長 10 分)。
+/// 設定の保存などで先に起動できていれば、そこでやめる。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn spawn_hook_retry_until_permitted(app: tauri::AppHandle) {
+    const RETRY_EVERY_SECS: u64 = 3;
+    const RETRY_FOR_SECS: u64 = 600;
+    tauri::async_runtime::spawn(async move {
+        for _ in 0..(RETRY_FOR_SECS / RETRY_EVERY_SECS) {
+            tokio::time::sleep(std::time::Duration::from_secs(RETRY_EVERY_SECS)).await;
+            let holder = app.state::<HookHolder>();
+            if holder.lock().map(|g| g.is_some()).unwrap_or(true) {
+                log::info!("[hotkey] hook already running; stop retrying");
+                return;
+            }
+            let config = load_hotkey_config_or_default().unwrap_or_else(|_| HotkeyConfig::default());
+            if start_keyboard_hook(&app, holder.inner(), config).is_ok() {
+                log::info!("[hotkey] started after permission was granted (no relaunch needed)");
+                let _ = app.emit("hotkey:ready", ());
+                return;
+            }
+        }
+        log::warn!("[hotkey] gave up retrying hook start after {}s", RETRY_FOR_SECS);
+    });
+}
+
 fn set_hook_recording(hook_holder: &HookHolder, val: bool) {
     if let Ok(guard) = hook_holder.lock() {
         if let Some(hook) = guard.as_ref() {

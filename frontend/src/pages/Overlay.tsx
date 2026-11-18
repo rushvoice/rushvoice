@@ -26,6 +26,7 @@ import {
   saveOverlayPosition,
   type Profile,
 } from '../lib/tauri'
+import { localizeKeyLabel } from '../lib/platform'
 
 type OverlayState = 'idle' | 'recording' | 'transcribing' | 'success' | 'error' | 'cancelled'
 
@@ -81,7 +82,7 @@ function formatHotkey(c: HotkeyConfig): string {
   const key =
     KEY_LABEL_JA[c.code] ??
     c.code.replace(/^Key/, '').replace(/^Digit/, '').replace(/^Arrow/, '')
-  return [...mods, key].join('+')
+  return localizeKeyLabel([...mods, key].join('+'))
 }
 
 // 2026-05-22 要望: state ごとに最適 window サイズで透明枠を最小化

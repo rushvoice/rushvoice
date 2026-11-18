@@ -592,6 +592,21 @@ pub fn get_hotkey_config() -> Result<HotkeyConfig, String> {
     }
 }
 
+/// ホットキーの仕組み (キーボードフック) が起動できないときに画面へ出す案内。
+fn hook_not_started_message() -> String {
+    if cfg!(target_os = "macos") {
+        concat!(
+            "ホットキーを使う許可がまだ効いていません。",
+            "システム設定 → プライバシーとセキュリティ → アクセシビリティ と 入力監視 で、",
+            "RushVoice を一度「−」で外してから「＋」で入れ直し、",
+            "RushVoice を終了して開き直してください。"
+        )
+        .to_string()
+    } else {
+        "ホットキーの仕組みを起動できませんでした。RushVoice を終了して開き直してください。".to_string()
+    }
+}
+
 /// 新しいホットキー設定で再登録する。
 ///
 /// 手順:
@@ -659,12 +674,24 @@ pub fn set_hotkey_config(
     let old_json = db.get_kv(HOTKEY_CONFIG_KEY).map_err(|e| e.to_string())?;
 
     // 3. KeyboardHook を新 config に更新
+    //    起動時にフックが始まっていなければ (Mac のアクセシビリティ未許可など)、ここで起動し直す。
+    let not_started = hook
+        .lock()
+        .map_err(|e| format!("hook lock poisoned: {}", e))?
+        .is_none();
+    if not_started {
+        if let Err(e) = crate::start_keyboard_hook(&app, hook.inner(), config.clone()) {
+            log::error!("[hotkey] KeyboardHook restart on save failed: {}", e);
+            return Err(hook_not_started_message());
+        }
+        log::info!("[hotkey] KeyboardHook started on save");
+    }
     let guard = hook
         .lock()
         .map_err(|e| format!("hook lock poisoned: {}", e))?;
     let hook_ref = guard
         .as_ref()
-        .ok_or_else(|| "KeyboardHook not initialized".to_string())?;
+        .ok_or_else(hook_not_started_message)?;
     hook_ref
         .update_config(config.clone())
         .map_err(|e| format!("update_config failed: {}", e))?;
