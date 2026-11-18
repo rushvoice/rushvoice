@@ -19,6 +19,7 @@ import * as Dialog from '@radix-ui/react-dialog'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { AlertTriangle, Settings } from 'lucide-react'
 import { getHotkeyConflictState, type ConflictState } from '../lib/tauri'
+import { localizeKeyLabel } from '../lib/platform'
 
 interface Props {
   onJumpToSettings: () => void
@@ -98,7 +99,7 @@ export function HotkeyConflictDialog({ onJumpToSettings }: Props) {
     else if (code === 'NonConvert') code = '無変換'
     else if (code === 'Convert') code = '変換'
     parts.push(code)
-    return parts.join(' + ')
+    return localizeKeyLabel(parts.join(' + '))
   }
 
   function handleJump() {

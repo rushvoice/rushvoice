@@ -31,6 +31,7 @@ import { CongestionBanner } from '../components/CongestionBanner'
 import { MicLowLevelBanner } from '../components/MicLowLevelBanner'
 import { QuietVoiceBanner } from '../components/QuietVoiceBanner'
 import { GatewayRetiredNotice } from '../components/GatewayRetiredNotice'
+import { localizeKeyLabel } from '../lib/platform'
 
 // 設定 hotkey を「右Ctrl + 右Shift + 無変換」のような日本語表記に
 const MOD_ORDER = [
@@ -66,7 +67,7 @@ function formatHotkey(c: HotkeyConfig): string {
   const key =
     KEY_LABEL_JA[c.code] ??
     c.code.replace(/^Key/, '').replace(/^Digit/, '').replace(/^Arrow/, '')
-  return [...mods, key].join(' + ')
+  return localizeKeyLabel([...mods, key].join(' + '))
 }
 
 // Phase 2 A: プロファイル表示順 (builtin_key の順序)
@@ -92,7 +93,7 @@ export function HomePage({ onOpenSettings }: { onOpenSettings?: () => void } = {
   // (Overlay は 3 秒で消えるため、全文を後から見たい時のための表示)
   const [latest, setLatest] = useState<string>('')
   // 要望 (2026-05-22): ホットキー説明文を hardcode せず DB から読込
-  const [hotkeyDisplay, setHotkeyDisplay] = useState<string>('Ctrl + Shift + 無変換')
+  const [hotkeyDisplay, setHotkeyDisplay] = useState<string>(localizeKeyLabel('Ctrl + Shift + 無変換'))
   // Phase 2 A: プロファイル選択
   const [profiles, setProfiles] = useState<Profile[]>([])
   const [activeKey, setActiveKey] = useState<string>('raw')
