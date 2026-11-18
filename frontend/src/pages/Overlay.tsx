@@ -291,6 +291,11 @@ export function Overlay() {
             if (!mounted) return
             setMessage('文字起こし中… 終わったらすぐ録音します')
           }),
+          // 2026-11-18: 30 秒ほど声が無く、録音を自動で止めた (押し間違い対策・speech_gate.rs)
+          await listen('recorder:auto-stopped', () => {
+            if (!mounted) return
+            setMessage('30秒ほど声が無かったので録音を止めました')
+          }),
           await listen<string>('recorder:error', (e) => {
             if (!mounted) return
             setState('error')

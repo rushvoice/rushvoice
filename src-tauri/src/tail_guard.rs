@@ -177,9 +177,70 @@ pub fn collapse_repeated_phrases(text: &str) -> (String, usize) {
     (out, removed)
 }
 
+/// 本文から既知の幻の句 (「ご視聴ありがとうございました」等) だけを取り除く (2026-11-18)。
+///
+/// 既定方針 (2026-08-02)「ハルシ疑いでも貼る」は守ったまま、本文に混ざった句だけを外す。
+/// 実例 id=8458: 句が本文の頭・途中・末尾に 3 回入ったまま貼られていた。
+/// 句の直後の句読点 (「。」「、」等) と前後の空白も一緒に外す。
+/// 戻り値: (新しい本文, 取り除いた回数)
+pub fn strip_known_phrases(text: &str, phrases: &[&str]) -> (String, usize) {
+    let mut out = text.to_string();
+    let mut removed = 0usize;
+    for p in phrases {
+        if p.is_empty() {
+            continue;
+        }
+        while let Some(pos) = out.find(p) {
+            let mut end = pos + p.len();
+            while let Some(c) = out[end..].chars().next() {
+                if matches!(c, '。' | '、' | '.' | ',' | '！' | '!' | ' ' | '　') {
+                    end += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            out.replace_range(pos..end, "");
+            removed += 1;
+        }
+    }
+    if removed == 0 {
+        return (text.to_string(), 0);
+    }
+    // 句の手前に残った読点 (「えっと、」+ 句) を外す
+    let out = out
+        .trim()
+        .trim_end_matches(['、', ',', ' ', '　'])
+        .to_string();
+    (out, removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PHRASES: &[&str] = &["ご視聴ありがとうございました", "ご視聴頂きありがとうございました"];
+
+    #[test]
+    fn strips_known_phrases_anywhere_case_8458() {
+        let t = "えっと。ご視聴ありがとうございました。です。店舗は、手の様子。ご視聴ありがとうございました。ご視聴ありがとうございました。";
+        let (out, n) = strip_known_phrases(t, PHRASES);
+        assert_eq!(n, 3);
+        assert_eq!(out, "えっと。です。店舗は、手の様子。");
+    }
+
+    #[test]
+    fn strip_leaves_normal_text_and_reports_empty() {
+        let (out, n) = strip_known_phrases("ご来店ありがとうございました。", PHRASES);
+        assert_eq!((out.as_str(), n), ("ご来店ありがとうございました。", 0));
+        let (out, n) = strip_known_phrases(" ご視聴頂きありがとうございました。 ", PHRASES);
+        assert_eq!((out.as_str(), n), ("", 1));
+    }
+
+    #[test]
+    fn strip_drops_comma_left_before_phrase() {
+        let (out, n) = strip_known_phrases("えっと、ご視聴ありがとうございました。", PHRASES);
+        assert_eq!((out.as_str(), n), ("えっと", 1));
+    }
 
     const REAL: &str = "ナーチャリングをステップ配信していくみたいなのが望ましいよね店船の中心を見ると、 コーティングについて、 コーティングについて、 コーティングについて、 コーティングを作る。";
 

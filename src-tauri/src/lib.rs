@@ -27,6 +27,7 @@ pub mod profile_db;
 pub mod prompt_sanitize;
 pub mod recent_audio;
 pub mod recorder;
+pub mod speech_gate;
 pub mod tail_guard;
 pub mod resampler;
 pub mod subtitle;
@@ -775,7 +776,20 @@ async fn acquire_hotkey_turn(
 /// Stage 2-C-2: ホットキーイベントのハンドラ。Toggle / PushToTalk のモード分岐。
 /// emit event + overlay window の show/hide も担当。
 async fn handle_hotkey_event(app: tauri::AppHandle, event: HotkeyEvent) {
-    log::info!("[hotkey-event] received: {:?}", event);
+    handle_hotkey_event_inner(app, event, false).await
+}
+
+/// 2026-11-18: 押し間違いで録音しっぱなしになったとき、録音側 (recorder.rs) から呼ぶ。
+/// Toggle の録音中だけ、ホットキーで止めたのと同じ処理 (文字起こし・捨てる判定) を行う。
+/// 止まっていた・別の押下を処理中のときは何もしない (新しく録音を始めないため)。
+pub(crate) fn request_auto_stop(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        handle_hotkey_event_inner(app, HotkeyEvent::Pressed, true).await;
+    });
+}
+
+async fn handle_hotkey_event_inner(app: tauri::AppHandle, event: HotkeyEvent, stop_only: bool) {
+    log::info!("[hotkey-event] received: {:?} stop_only={}", event, stop_only);
 
     // v0.1.16 機能 L Day 4 (L-R7): 議事録録音中はホットキー処理を skip する。
     // MeetingHolder::is_recording は内部で Mutex を try-take し、poisoned 時は false を返す
@@ -812,6 +826,18 @@ async fn handle_hotkey_event(app: tauri::AppHandle, event: HotkeyEvent) {
     // 二重に止めようとして失敗したり、書き起こし・貼り付け中の押下が合図なしで捨てられていた。
     let _hotkey_turn = if matches!(event, HotkeyEvent::Cancel) {
         None
+    } else if stop_only {
+        // 自動停止は順番待ちしない (待つ間に状態が変わると録音を始めてしまう)
+        match HOTKEY_TURN
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .try_lock()
+        {
+            Ok(g) => Some(g),
+            Err(_) => {
+                log::info!("[hotkey-event] auto stop skipped: another press is being handled");
+                return;
+            }
+        }
     } else {
         match acquire_hotkey_turn(&app, event, &config.mode).await {
             Some(g) => Some(g),
@@ -840,6 +866,14 @@ async fn handle_hotkey_event(app: tauri::AppHandle, event: HotkeyEvent) {
 
     let holder = app.state::<RecorderHolder>();
     let hook_holder = app.state::<HookHolder>();
+
+    if stop_only
+        && !(matches!(config.mode, HotkeyMode::Toggle)
+            && matches!(holder.current_state(), RecorderState::Recording))
+    {
+        log::info!("[hotkey-event] auto stop skipped: not recording in toggle mode");
+        return;
+    }
 
     match (event, config.mode) {
         (HotkeyEvent::Pressed, HotkeyMode::Toggle) => {
