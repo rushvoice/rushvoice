@@ -5,8 +5,6 @@ name: Release
 #
 # - 署名: macOS は ad-hoc（Apple Developer Program は使わない）、Windows は未署名。
 #   ⚠️ APPLE_CERTIFICATE などの署名用 secrets / env を足さない（空でも security import が失敗する）。
-# - RUSHVOICE_GATEWAY_BASE_URL（secret）: 公式版で RushVoice アカウントのログインを有効にするための接続先。
-#   無くてもビルドは通り、その場合は自分の API キーで使う版になる。
 # - タグ v* を作れるのは Org の管理者だけ（リポジトリの ruleset で制限）。外部 PR からは動かない。
 
 "on":
@@ -44,7 +42,6 @@ jobs:
     timeout-minutes: 90
     env:
       APPLE_SIGNING_IDENTITY: "-"
-      RUSHVOICE_GATEWAY_BASE_URL: ${{ secrets.RUSHVOICE_GATEWAY_BASE_URL }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
