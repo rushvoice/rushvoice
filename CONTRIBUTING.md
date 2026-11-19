@@ -23,3 +23,5 @@ PR を送った時点で、その貢献は Apache License 2.0 の下で提供さ
 ---
 
 Thanks for contributing! Please open an issue before large changes, run `cargo fmt`, `cargo clippy`, `cargo test` and `pnpm lint`, and never commit secrets or personal data. Contributions are licensed under Apache-2.0.
+
+外の人の PR は `docs/PR_REVIEW.md` の手順で確かめてから取り込みます。危ないところに触る PR には自動で「要確認」の印が付きます。

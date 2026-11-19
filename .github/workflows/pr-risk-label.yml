@@ -1,0 +1,41 @@
+name: PR risk label
+
+# 危ないところ（鍵・送り先・依存・組み立て・読めないファイル・新しい URL）に触る PR に「要確認」の印を付ける。
+#
+# 安全のための決まり（pull_request_target は本体側の権限で動くため）:
+# - PR のコードを checkout しない・実行しない。変更ファイルの一覧と差分を「データとして」読むだけ。
+# - PR の題名・本文・差分をシェルのコマンドに埋め込まない。
+# - 権限は印付けとコメントに要るものだけ。secrets は使わない。
+
+"on":
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
+        with:
+          sync-labels: false
+
+      - name: Flag new URLs in the diff
+        # Dependabot の更新はロックファイルの URL で毎回当たるため除く（依存の印は labeler が付ける）
+        if: github.event.pull_request.user.login != 'dependabot[bot]'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh pr diff "$PR" -R "$REPO" > diff.txt
+          grep -E '^\+[^+]' diff.txt > added.txt || true
+          if grep -qiE 'https?://|wss?://' added.txt; then
+            gh pr edit "$PR" -R "$REPO" --add-label "要確認: 通信先"
+            echo "::warning::この PR は新しい URL を足しています。送り先が正しいか確かめてください（docs/PR_REVIEW.md）。"
+          fi
