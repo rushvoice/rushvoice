@@ -1,0 +1,45 @@
+# 危ないところに触る PR に印を付ける（.github/workflows/pr-risk-label.yml から使う）。
+# 印が付いた PR は、docs/PR_REVIEW.md の確認とメンテナーの判断を経てから取り込む。
+
+"要確認: 鍵・送り先":
+  - changed-files:
+      - any-glob-to-any-file:
+          - src-tauri/src/crypto/**
+          - src-tauri/src/endpoints.rs
+          - src-tauri/src/transcribe.rs
+          - src-tauri/src/hedged.rs
+          - src-tauri/src/llm_postprocess.rs
+          - src-tauri/src/clipboard/**
+          - src-tauri/src/keyboard_hook/**
+
+"要確認: 依存の追加":
+  - changed-files:
+      - any-glob-to-any-file:
+          - src-tauri/Cargo.toml
+          - src-tauri/Cargo.lock
+          - frontend/package.json
+          - frontend/pnpm-lock.yaml
+
+"要確認: 組み立て・権限":
+  - changed-files:
+      - any-glob-to-any-file:
+          - .github/**
+          - src-tauri/build.rs
+          - src-tauri/tauri.conf.json
+          - src-tauri/capabilities/**
+          - src-tauri/Entitlements.plist
+          - src-tauri/Info.plist
+          - scripts/**
+
+"要確認: 読めないファイル":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.exe"
+          - "**/*.dll"
+          - "**/*.dylib"
+          - "**/*.so"
+          - "**/*.node"
+          - "**/*.wasm"
+          - "**/*.bin"
+          - "**/*.zip"
+          - "**/*.jar"
