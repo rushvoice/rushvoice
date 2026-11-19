@@ -51,4 +51,5 @@ jobs:
           pnpm build
       - name: Rust tests
         working-directory: src-tauri
-        run: cargo test --locked --lib
+        # macOS ではテストがキーチェーンを共有するため、並列だと取り合いになる。1本ずつ順に動かす。
+        run: cargo test --locked --lib -- --test-threads=1
