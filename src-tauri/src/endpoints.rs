@@ -41,7 +41,7 @@ pub const GROQ_CHAT_MODEL: &str = "openai/gpt-oss-120b";
 /// Groq の日次枠が尽きたときの退避先 (小型)
 pub const GROQ_CHAT_FALLBACK_MODEL: &str = "openai/gpt-oss-20b";
 /// 整文・翻訳のモデル候補 (前から順に試す)。提供元がモデルを廃止・上限に達したら次の候補で続ける
-/// (2026-11-16 会長要望「複数用意しておく」)。使えない候補は接続先の /models で飛ばす。
+/// (2026-11-16 メンテナーの要望「複数用意しておく」)。使えない候補は接続先の /models で飛ばす。
 pub const GROQ_CHAT_MODELS: &[&str] = &[GROQ_CHAT_MODEL, "qwen/qwen3.8-27b", GROQ_CHAT_FALLBACK_MODEL];
 pub const OPENAI_CHAT_MODELS: &[&str] = &[OPENAI_CHAT_MODEL, "gpt-4.1-mini"];
 /// OpenAI の整文モデル
