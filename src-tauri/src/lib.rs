@@ -15,6 +15,7 @@ pub mod hotkey;
 pub mod hotkey_conflict;
 pub mod keyboard_hook;
 pub mod llm_postprocess;
+pub mod model_catalog;
 pub mod accessibility_permission;
 pub mod meeting;
 pub mod meeting_commands;
@@ -276,6 +277,9 @@ pub fn run() {
             // 2026-11-15: 有料版のゲートウェイ終了。旧版でログインしていた利用者のログイン情報を捨て、
             // 「自分のキーか接続先を設定してください」の案内を出す印を立てる (冪等・best-effort)。
             endpoints::retire_gateway_login();
+
+            // 2026-11-21: 整文・翻訳のモデル候補の公開の一覧 (models.json) を裏で取り直す (1 日 1 回まで)。
+            model_catalog::spawn_refresh(false);
 
             // Day 25 Phase 2-G (SSOT v3.3): v0.1.6 (alias.db あり) → v0.1.7 マイグレーション。
             // Day 24 で実装した alias.db を既存ユーザー PC から削除する (best-effort)。

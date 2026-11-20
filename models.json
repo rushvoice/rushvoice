@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "updated": "2026-11-21",
+  "note": "RushVoice reads this list to choose chat models (tidy-up / translation) without an app update. Models are tried in order. Only model names may be listed here.",
+  "chat": {
+    "groq": ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"],
+    "openai": ["gpt-4o-mini", "gpt-4.1-mini"]
+  }
+}
