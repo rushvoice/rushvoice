@@ -127,6 +127,16 @@ API キーは、アプリの設定画面に入れると端末内で暗号化し�
 - コードの貢献: [CONTRIBUTING.md](CONTRIBUTING.md)
 - 脆弱性の報告: [SECURITY.md](SECURITY.md)（Issue には書かないでください）
 
+## 質問・相談の場
+
+- ユーザー同士で教え合う場: [LINE オープンチャット「RushVoice ユーザーの会」](https://line.me/ti/g2/UlauFOXYsGIiKB8XncZICRId5FoqnG3JIYzOYw)（使い方の質問・作り変えた設定の共有・要望）
+- 1対1の相談・会社での導入の相談: LINE 公式アカウント `@935mjmle`
+- お知らせ: X [@RushVoiceApp](https://x.com/RushVoiceApp)
+
+どの場でも、API キー・パスワード・個人情報は書かないでください（画面の写真にも写らないように）。設定やプロフィールを共有するときは、書き出したファイルや画面からキー・接続先の URL・トークンを消してからにしてください。
+オープンチャットでの運営の発言は「RushVoice 運営」の名前だけです。運営がキー・パスワード・お金を求めたり、個別のトークへ誘ったりすることはありません。そうした書き込みは無視して、運営へ知らせてください。
+不具合は再現手順を添えて [Issues](../../issues) へ。
+
 ## ライセンス
 
 コードは [Apache License 2.0](LICENSE) です。Apache License は商標の使用を許諾しません。「RushVoice」の名前の扱いは [TRADEMARKS.md](TRADEMARKS.md) の商標の方針に従ってください。
@@ -142,6 +152,7 @@ RushVoice is a push-to-talk voice input app built with Tauri 2 (Rust) and React.
 - Transcription and rewriting can use different endpoints. In Settings → "接続先と API キー", choose **Custom** and enter a base URL up to `/v1` (the app appends `/audio/transcriptions` or `/chat/completions`), a model name and an optional key. Examples: Ollama `http://localhost:11434/v1` (model e.g. `qwen2.5:7b`), LM Studio `http://localhost:1234/v1`, whisper.cpp server `http://127.0.0.1:8080/v1`, speaches / faster-whisper servers `http://localhost:8000/v1`. Meeting minutes and subtitles need a transcription server that supports `verbose_json`.
 - The same safety checks apply to every endpoint: if the rewritten text grows too much, drops sentences or turns a request into an answer, the original transcript is pasted instead.
 - Audio and transcripts are sent only to the endpoints you choose; with a local server nothing leaves your machine. History, dictionary and settings are stored on your device; some dictionary terms are sent along with the audio to improve recognition.
+- Community (Japanese): LINE OpenChat "RushVoice ユーザーの会" https://line.me/ti/g2/UlauFOXYsGIiKB8XncZICRId5FoqnG3JIYzOYw , news on X [@RushVoiceApp](https://x.com/RushVoiceApp). Never post API keys or personal data there.
 - The former paid RushVoice account was discontinued in November 2026; saved sign-in data is removed on first launch after updating.
 - Build: `cargo install tauri-cli --version "^2" --locked`, `cd frontend && pnpm install`, then `cd ../src-tauri && cargo tauri dev`.
 - Install: see [INSTALL.md](INSTALL.md) (includes step-by-step instructions for AI agents).
