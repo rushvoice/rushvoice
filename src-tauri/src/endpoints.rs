@@ -83,6 +83,18 @@ pub fn with_reasoning_headroom(model: &str, max_tokens: u32) -> u32 {
 
 /// Groq / OpenAI のモデル候補を設定で上書きする (カンマ区切りで複数可・前から順に試す)。
 /// カスタムは元からモデル名を持つので触らない。空なら既定の候補のまま。
+/// 公開の一覧 (models.json) の候補を当てる。カスタムは触らない。一覧に無ければ既定のまま。
+pub fn apply_catalog(mut ep: ChatEndpoint, catalog: Option<&crate::model_catalog::ModelCatalog>) -> ChatEndpoint {
+    if ep.label == "custom" {
+        return ep;
+    }
+    if let Some(list) = catalog.and_then(|c| c.chat_models(ep.label)) {
+        ep.model = list[0].clone();
+        ep.candidates = list.to_vec();
+    }
+    ep
+}
+
 pub fn apply_model_override(mut ep: ChatEndpoint, model_override: &str) -> ChatEndpoint {
     let list = parse_model_list(model_override);
     if ep.label != "custom" && !list.is_empty() {
@@ -612,6 +624,8 @@ pub fn load_chat_endpoint() -> Result<ChatEndpoint, String> {
         "openai" => OPENAI_LLM_MODEL_KEY,
         _ => return Ok(ep),
     };
+    // 優先順: 利用者の設定 > 公開の一覧 (models.json) > 組み込みの既定値
+    let ep = apply_catalog(ep, crate::model_catalog::load_cached_catalog().as_ref());
     Ok(apply_model_override(ep, &kv(db.as_ref(), override_key)))
 }
 
@@ -987,6 +1001,30 @@ mod tests {
         // 「無い」と返されたものは外す。全部外れたら全部をもう一度
         assert_eq!(filter_candidates(&c, None, &|m| m == "a"), vec!["b", "c"]);
         assert_eq!(filter_candidates(&c, None, &|_| true), c);
+    }
+
+    #[test]
+    fn catalog_then_user_override_priority() {
+        let keys = SecretsBundle { groq_api_key: Some("k".into()), ..Default::default() };
+        let g = resolve_chat_endpoint(LlmProvider::Groq, &keys, &CustomEndpointConfig::default()).unwrap();
+        let cat = crate::model_catalog::parse_catalog(r#"{"schema":1,"chat":{"groq":["new-a","new-b"]}}"#).unwrap();
+        // 一覧が無ければ既定のまま
+        assert_eq!(apply_catalog(g.clone(), None), g);
+        // 一覧があれば差し替わる
+        let c = apply_catalog(g.clone(), Some(&cat));
+        assert_eq!(c.model, "new-a");
+        assert_eq!(c.candidates, vec!["new-a", "new-b"]);
+        // 利用者の設定が一番強い
+        assert_eq!(apply_model_override(c.clone(), "mine").candidates, vec!["mine"]);
+        assert_eq!(apply_model_override(c, " ").model, "new-a");
+        // OpenAI の一覧が無いときは OpenAI は既定のまま
+        let keys_o = SecretsBundle { openai_api_key: Some("k".into()), ..Default::default() };
+        let o = resolve_chat_endpoint(LlmProvider::Openai, &keys_o, &CustomEndpointConfig::default()).unwrap();
+        assert_eq!(apply_catalog(o.clone(), Some(&cat)), o);
+        // カスタムは触らない
+        let custom = CustomEndpointConfig { base_url: "http://localhost:11434/v1".into(), model: "qwen2.5:7b".into() };
+        let cu = resolve_chat_endpoint(LlmProvider::Custom, &SecretsBundle::default(), &custom).unwrap();
+        assert_eq!(apply_catalog(cu.clone(), Some(&cat)), cu);
     }
 
     #[test]

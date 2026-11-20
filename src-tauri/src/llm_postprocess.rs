@@ -374,6 +374,8 @@ pub async fn apply_llm_postprocess(
                     candidates
                 );
                 crate::endpoints::set_model_update_needed(true);
+                // 公開の一覧が新しくなっていれば次の整文から使えるよう、急ぎで取り直す
+                crate::model_catalog::spawn_refresh(true);
             }
         }
         return text.to_string();
